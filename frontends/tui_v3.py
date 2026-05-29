@@ -362,15 +362,12 @@ _I18N: dict[str, dict[str, str]] = {
         'pending.head_running':  'queued {n} · injecting at next turn boundary · Esc to clear',
         'pending.cleared':       'cleared {n} pending message(s)',
         'pending.queued_marker': '[queued] {text}',
-        # Wrap user steers with explicit "finish current task first"
-        # phrasing so the `[MASTER]` envelope (ga.py:578) reads as
-        # supplementary, not as a directive override that drops the
-        # original task.
-        'pending.inject_wrap':   ('The user sent a new message while you '
-                                  'were working:\n{text}\n\nIMPORTANT: After '
-                                  'completing your current task, you MUST '
-                                  'address the user\'s message above. Do '
-                                  'not ignore it.'),
+        # Soft-guidance wrap: treat a mid-task user message as steering input
+        # for the ongoing task, rather than a deferred must-answer queue item.
+        'pending.inject_wrap':   ('User sent a message while you were '
+                                  'working:\n{text}\n'
+                                  'Please take it into consideration and '
+                                  'adjust direction if needed.'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! for shell mode',
@@ -615,9 +612,8 @@ _I18N: dict[str, dict[str, str]] = {
         'pending.head_running':  '已排队 {n} 条 · 下个 turn 边界注入 · Esc 清空',
         'pending.cleared':       '已清空 {n} 条待发送消息',
         'pending.queued_marker': '[排队] {text}',
-        'pending.inject_wrap':   ('用户在你工作时发来了一条新消息：\n{text}\n\n'
-                                  '重要：完成当前任务后，你必须处理上面的用户消息。'
-                                  '不要忽略它。'),
+        'pending.inject_wrap':   ('用户在你工作时发来了一条新消息：\n{text}\n'
+                                  '请将其纳入考虑，必要时调整方向。'),
 
         # shell-mode magic (`!` prefix)
         'shell.hint':           '! 进入 shell 模式',
@@ -1347,10 +1343,16 @@ class AgentBridge:
         # Wrapped user messages we appended to `_intervene` since the last
         # turn boundary.  At a non-exit boundary the file was consumed and
         # next_prompt now carries our text — clear the list.  At an exit
-        # boundary the file was consumed but next_prompt is discarded —
-        # replay via put_task so the user's words aren't lost.
+        # boundary the file was consumed but next_prompt is discarded — replay
+        # via put_task so the user's words aren't lost.
         self._intervene_pending: list[str] = []
         self._intervene_lk = threading.Lock()
+        # Display queue created when an exit-boundary replay re-submits queued
+        # user messages (see `_on_turn_end`).  Handed to the UI via
+        # `take_replay_dq` so it drains the follow-up run; without this the
+        # replayed turn streams headless — recorded in model_responses but
+        # never shown in the current TUI session.
+        self._replay_dq: queue.Queue | None = None
         self._install_hook()
         self._healthy = True
         self._init_error: str | None = None
@@ -1410,10 +1412,23 @@ class AgentBridge:
             if (ctx or {}).get('exit_reason'):
                 combined = '\n\n'.join(self._intervene_pending)
                 self._intervene_pending = []
-                try: self.agent.put_task(combined, source='user')
+                try: self._replay_dq = self.agent.put_task(combined, source='user')
                 except Exception: pass
             else:
                 self._intervene_pending = []
+
+    def take_replay_dq(self) -> "queue.Queue | None":
+        """Hand off the display_queue from an exit-boundary replay once.
+
+        If a queued mid-run user message is consumed on the same boundary that
+        exits the current task, ga discards next_prompt.  `_on_turn_end` replays
+        it with put_task; the TUI must then drain that returned queue or the
+        reply is written only to model_responses and appears only after
+        /continue.
+        """
+        with self._intervene_lk:
+            dq, self._replay_dq = self._replay_dq, None
+            return dq
 
     def submit(self, query: str, images: list | None = None) -> queue.Queue:
         return self.agent.put_task(query, source='user', images=images)
@@ -4804,6 +4819,24 @@ class SB:
         _set_term_title(self._term_title())
         with self._lk:
             self._flow(final=True) if self._stream else self._render_live()
+        # Exit-boundary replay: a queued user message can be consumed at the
+        # same turn boundary that finishes the current task.  The bridge replays
+        # it via put_task; drain that returned queue here so the reply is shown
+        # live instead of only appearing later through /continue.
+        replay = None
+        if self._bridge._replay_dq is not None:
+            with self._lk:
+                replay = self._bridge.take_replay_dq()
+                if replay is not None:
+                    for msg in self._pending:
+                        self._commit_user(_t('pending.queued_marker', text=msg))
+                    self._pending = []
+                    self._running = True
+                    self._stream = ''; self._sent = 0; self._live_tail = []
+                    self._t0 = self._t0_anchor = time.time()
+            if replay is not None:
+                threading.Thread(target=self._ticker, daemon=True).start()
+                self._drain(replay)
 
     def _enter_ask(self, ae: AskUserEvent) -> None:
         if self._stream.strip():

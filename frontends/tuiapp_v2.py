@@ -4589,14 +4589,18 @@ class GenericAgentTUI(App[None]):
     # exit-turn boundary consume_file ate the file but next_prompt was
     # discarded — the replay hook re-routes via put_task.
 
+    # Soft-guidance wrap — frame the user's mid-task message as input to fold
+    # into ongoing reasoning, not a deferred queue item. This lets the model
+    # redirect mid-flight if the message warrants it.
     _INTERVENE_WRAP_EN = (
-        "The user sent a new message while you were working:\n{text}\n\n"
-        "IMPORTANT: After completing your current task, you MUST address "
-        "the user's message above. Do not ignore it."
+        "User sent a message while you were working:\n"
+        "{text}\n"
+        "Please take it into consideration and adjust direction if needed."
     )
     _INTERVENE_WRAP_ZH = (
-        "用户在你工作时发来了一条新消息：\n{text}\n\n"
-        "重要：完成当前任务后，你必须处理上面的用户消息。不要忽略它。"
+        "用户在你工作时发来了一条新消息：\n"
+        "{text}\n"
+        "请将其纳入考虑，必要时调整方向。"
     )
 
     def _wrap_user_steer(self, text: str) -> str:
@@ -4655,8 +4659,24 @@ class GenericAgentTUI(App[None]):
                     _s.pending_wrapped = []
                     _s.pending = []
                 if (ctx or {}).get("exit_reason"):
-                    try: _s.agent.put_task(combined, source="user")
-                    except Exception: pass
+                    try:
+                        dq = _s.agent.put_task(combined, source="user")
+                    except Exception:
+                        dq = None
+                    if dq is not None:
+                        _s.task_seq += 1
+                        tid = _s.task_seq
+                        _s.current_task_id = tid
+                        _s.current_display_queue = dq
+                        _s.buffer = ""
+                        _s.status = "running"
+                        _s.messages.append(ChatMessage("assistant", "", task_id=tid, done=False))
+                        threading.Thread(
+                            target=self._consume_display_queue,
+                            args=(_s.agent_id, tid, dq),
+                            daemon=True,
+                            name=f"ga-tui-consume-{_s.agent_id}-{tid}",
+                        ).start()
                 try: self.call_from_thread(self._refresh_messages)
                 except Exception: pass
                 try: self.call_from_thread(self._refresh_bottombar)
@@ -4732,7 +4752,31 @@ class GenericAgentTUI(App[None]):
 
     def _on_stream(self, agent_id, task_id, text, done):
         s = self.sessions.get(agent_id)
-        if not s or s.current_task_id != task_id:
+        if not s: return
+        if s.current_task_id != task_id:
+            # Exit-boundary replay can start a follow-up task before the original
+            # display queue emits its final `done`.  The old done event must still
+            # settle that assistant message; otherwise a single-turn interrupted
+            # run keeps its spinner forever while the replay task owns
+            # current_task_id.
+            if done:
+                found = None
+                for m in reversed(s.messages):
+                    if m.role == "assistant" and m.task_id == task_id:
+                        m.content = text
+                        m.done = True
+                        found = m
+                        break
+                if found and agent_id == self.current_id:
+                    if found._segment_widgets:
+                        try: self._stream_update_assistant(found)
+                        except Exception: self._refresh_messages()
+                    else:
+                        self._refresh_messages()
+                    if refresh_chrome:
+                        self._refresh_sidebar()
+                        self._refresh_topbar()
+                    self._ensure_spinner()
             return
         s.buffer = text
         if done:
