@@ -358,7 +358,7 @@ def _start_wechat_scheduler(bot):
                     outputs = item.get('outputs') or []
                     result = item.get('done', '')
                     final = (outputs[-1] if outputs else '') or result
-                    text = _clean(final).strip()
+                    text = re.sub(r'\[FILE:[^\]]+\]', '', _clean(final)).strip()  # 剥 [FILE:] 标记
                     try:
                         if text:
                             bot.send_text(target, text[:3000])
@@ -382,21 +382,32 @@ def _fmt_tool(tc):
     return f"{name}({str(args)[:120]})"
 
 def _wx_send_file(bot, to_uid, fpath, ctx=''):
-    """按扩展名选 send_image/send_video/send_file，发一个文件。容错不抛。"""
+    """按扩展名选 send_image/send_video/send_file 发文件。图片/视频发送失败（如坏图 PIL
+    打不开）时回退 send_file 原始上传——保证文件总能送达（对齐企微的容错）。容错不抛。"""
     if not os.path.isabs(fpath):
         fpath = os.path.join(_TEMP_DIR, fpath)
+    if not os.path.exists(fpath):
+        print(f'[WX] send media err: 文件不存在 {fpath}', file=sys.__stdout__, flush=True)
+        return False
+    ext = os.path.splitext(fpath)[1].lower()
+    sender = bot.send_video if ext in {'.mp4', '.mov', '.m4v', '.webm'} else \
+             bot.send_image if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} else bot.send_file
     try:
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(fpath)
-        ext = os.path.splitext(fpath)[1].lower()
-        sender = bot.send_video if ext in {'.mp4', '.mov', '.m4v', '.webm'} else \
-                 bot.send_image if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} else bot.send_file
         sender(to_uid, fpath, context_token=ctx)
         print(f'[WX] sent media: {fpath}', file=sys.__stdout__, flush=True)
         return True
     except Exception as e:
-        print(f'[WX] send media err: {e}', file=sys.__stdout__, flush=True)
-        return False
+        if sender is bot.send_file:
+            print(f'[WX] send_file 失败: {e}', file=sys.__stdout__, flush=True)
+            return False
+        print(f'[WX] 图片/视频发送失败({e})，回退 send_file', file=sys.__stdout__, flush=True)
+        try:
+            bot.send_file(to_uid, fpath, context_token=ctx)
+            print(f'[WX] sent as file（回退）: {fpath}', file=sys.__stdout__, flush=True)
+            return True
+        except Exception as e2:
+            print(f'[WX] send_file 回退也失败: {e2}', file=sys.__stdout__, flush=True)
+            return False
 
 if not hasattr(agent, '_turn_end_hooks'):
     agent._turn_end_hooks = {}
@@ -488,7 +499,8 @@ def on_message(bot, msg):
         result = item.get('done', '')
         outputs = item.get('outputs', [])
         aborted = _task_aborted.pop(uid, False)
-        final = _clean((outputs[-1] if outputs else '') or result).strip()
+        final = _clean((outputs[-1] if outputs else '') or result)
+        final = re.sub(r'\[FILE:[^\]]+\]', '', final).strip()   # 剥掉 [FILE:] 标记，文件单独作附件发
         if aborted:
             final = (final + '\n\n⏹️ [已停止]').strip()
         if final:
