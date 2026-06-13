@@ -121,7 +121,11 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 - ⭐**一键释放与登录**：bringToFront → mousePressed点任一字段(无需Released，一个释放全页) → 等500ms → 补input/change事件 → 点登录
 
 ## 验证码/页面视觉截图
-- ⭐首选CDP截图：`Page.captureScreenshot`(format:'png')→返回base64，无需前台/后台tab也行，全页高清
+- ⭐⭐**截图存文件首选**（PlaywrightDriver，一步出合法 PNG，勿手动处理 base64）：
+  `web_execute_js script='{"cmd":"screenshot","path":"/data/platform/output/x.png","fullPage":true}'`
+  （可选 `"selector":"css"` 只截某元素）→ 直接存合法文件 → 回复 `[FILE:/data/platform/output/x.png]` 发给用户。
+  **不要**自己 `code_run` 解 base64 写文件——极易把 base64 文本当字节存成坏图，微信/企微打不开。
+- **[仅 TMWebDriver]** CDP截图：`Page.captureScreenshot`(format:'png')→返回base64（自己解码存盘易出错，能用上面的 screenshot 就别用这个）
 - 验证码canvas/img：JS `canvas.toDataURL()` 直接拿base64最干净
 
 ## simphtml与driver调试

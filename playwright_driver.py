@@ -373,9 +373,33 @@ class PlaywrightDriver:
             return {"data": self._cookies(msg, default_sid)}
         if cmd == "batch":
             return {"data": self._batch(msg, default_sid)}
+        if cmd == "screenshot":
+            return {"data": self._screenshot(msg, default_sid)}
         if cmd in ("management", "contentSettings"):
             raise Exception(f"{cmd} 在 playwright 后端不支持（浏览器扩展专用能力，容器内无扩展）")
         raise Exception(f"Unknown cmd: {cmd}")
+
+    def _screenshot(self, msg, default_sid):
+        """直接用 playwright 原生 page.screenshot 存合法 PNG（agent 无需手动处理 base64）。
+        {"cmd":"screenshot","path":"/data/platform/output/x.png","fullPage":true,"selector":"可选"}"""
+        path = msg.get("path")
+        if not path:
+            raise Exception("screenshot 需要 path（保存路径）")
+        page = self._live_page(str(msg.get("tabId") or default_sid))
+        if page is None:
+            raise Exception("无可用页面，先用 web_execute_js 导航到目标页")
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        selector = msg.get("selector")
+        if selector:
+            el = page.query_selector(selector)
+            if el is None:
+                raise Exception(f"selector 未匹配元素: {selector}")
+            el.screenshot(path=path)
+        else:
+            page.screenshot(path=path, full_page=bool(msg.get("fullPage", True)))
+        return {"path": path, "ok": True}
 
     def _cdp(self, sid, method, params):
         if not method:
