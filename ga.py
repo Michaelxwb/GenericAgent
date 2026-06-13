@@ -428,7 +428,9 @@ class GenericAgentHandler(BaseHandler):
             if tgt:
                 try:
                     obj = json.loads(content)
-                    if isinstance(obj, dict) and not obj.get('target'):
+                    # 仅给任务型 JSON 盖章（有 schedule 或 prompt），避免给配置等无关文件加字段
+                    if (isinstance(obj, dict) and not obj.get('target')
+                            and (obj.get('schedule') or obj.get('prompt'))):
                         obj['target'] = tgt
                         content = json.dumps(obj, ensure_ascii=False, indent=2)
                 except Exception:

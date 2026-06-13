@@ -61,13 +61,17 @@ _WRAPPER = r"""(async () => {
       const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
       let r;
       function _air(c) { const ls = c.split(/\r?\n/); let i = ls.length - 1; while (i >= 0 && !ls[i].trim()) i--; if (i < 0) return c; const t = ls[i].trim(); if (/^(return |return;|return$|let |const |var |if |if\(|for |for\(|while |while\(|switch|try |throw |class |function |async |import |export |\/\/|})/.test(t)) return c; ls[i] = ls[i].match(/^(\s*)/)[1] + 'return ' + t; return ls.join('\n'); }
-      if (lastLine.startsWith('return')) {
-        r = await (new AsyncFunction(jsCode))();
-      } else {
-        try { r = eval(jsCode); if (r instanceof Promise) r = await r; } catch (e) {
-          if (e instanceof SyntaxError && (/return/i.test(e.message) || /await/i.test(e.message))) { r = await (new AsyncFunction(_air(jsCode)))(); } else throw e;
+      const __exec = async () => {
+        if (lastLine.startsWith('return')) { return await (new AsyncFunction(jsCode))(); }
+        try { let v = eval(jsCode); if (v instanceof Promise) v = await v; return v; }
+        catch (e) {
+          if (e instanceof SyntaxError && (/return/i.test(e.message) || /await/i.test(e.message))) { return await (new AsyncFunction(_air(jsCode)))(); }
+          throw e;
         }
-      }
+      };
+      // JS 级超时 race：异步代码永不 resolve 时也会被拒绝返回，避免卡住 worker（同步死循环仍需 worker 重建兜底）
+      const __to = new Promise((_, rej) => setTimeout(() => rej(new Error('JS执行超时 __TIMEOUT_S__s')), __TIMEOUT_MS__));
+      r = await Promise.race([__exec(), __to]);
       return { ok: true, data: smartProcessResult(r) };
     } catch (e) {
       return { ok: false, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' } };
@@ -75,8 +79,11 @@ _WRAPPER = r"""(async () => {
   })()"""
 
 
-def _build_exec_script(code: str) -> str:
-    return _WRAPPER.replace("__CODE_LITERAL__", json.dumps(code))
+def _build_exec_script(code: str, timeout_ms: int = 15000) -> str:
+    return (_WRAPPER
+            .replace("__CODE_LITERAL__", json.dumps(code))
+            .replace("__TIMEOUT_MS__", str(int(timeout_ms)))
+            .replace("__TIMEOUT_S__", str(int(timeout_ms / 1000))))
 
 
 def _parse_meta_cmd(code):
@@ -100,6 +107,22 @@ def _safe_title(page):
         return page.title()
     except Exception:
         return ""
+
+
+_ALLOWED_WRITE_ROOTS = ("/data/platform/output", "/data/ga", "/tmp")
+
+
+def _safe_output_path(path):
+    """限制截图写入在允许目录内（防 agent 越界写 /secrets、覆盖系统文件）。
+    相对路径落到 /data/platform/output；realpath 解析后必须在白名单根下，否则拒绝。"""
+    if not path:
+        raise Exception("path 不能为空")
+    if not os.path.isabs(path):
+        path = os.path.join("/data/platform/output", path)
+    real = os.path.realpath(path)
+    if not any(real == r or real.startswith(r + "/") for r in _ALLOWED_WRITE_ROOTS):
+        raise Exception(f"路径不允许: {path}（仅限 {', '.join(_ALLOWED_WRITE_ROOTS)}）")
+    return real
 
 
 # 反检测 init script：在每个页面/frame 文档创建前注入，抹掉 headless/自动化指纹。
@@ -182,24 +205,47 @@ class PlaywrightDriver:
         self._locale = os.environ.get("GA_BROWSER_LOCALE", "zh-CN")
         self._timezone = os.environ.get("GA_BROWSER_TIMEZONE", "Asia/Shanghai")
 
-        self._pages = {}            # sid(str) -> playwright Page
-        self._cdp_sessions = {}     # sid(str) -> CDPSession（懒建，复用）
         self._sid_counter = 0
         self._last_save = 0.0       # storageState 上次回写时间（节流用）
+        self._call_lock = threading.Lock()   # serialize callers (GA is sequential anyway)
+        self._recreating = False
+        self._start_worker(initial=True)
+
+    def _start_worker(self, initial=False):
+        """启动（或重建）worker 线程 + 全新浏览器。重建时旧 worker（卡在 evaluate）被弃用、
+        守护线程随进程退出。每个 worker 用自己捕获的队列，避免新旧 worker 抢同一队列。"""
+        self._pages = {}            # sid(str) -> playwright Page
+        self._cdp_sessions = {}     # sid(str) -> CDPSession（懒建，复用）
+        self.default_session_id = None
+        self.latest_session_id = None
         self._cmd_q = queue.Queue()
         self._ready = threading.Event()
         self._init_error = None
-        self._call_lock = threading.Lock()   # serialize callers (GA is sequential anyway)
-
-        self._worker = threading.Thread(target=self._run, name="pw-driver", daemon=True)
-        self._worker.start()
+        cmd_q = self._cmd_q
+        threading.Thread(target=self._run, args=(cmd_q,), name="pw-driver", daemon=True).start()
         if not self._ready.wait(timeout=90):
-            raise RuntimeError("PlaywrightDriver 启动超时（浏览器未就绪）")
+            if initial:
+                raise RuntimeError("PlaywrightDriver 启动超时（浏览器未就绪）")
+            print("[PlaywrightDriver] 重建超时（浏览器未就绪）")
+            return
         if self._init_error:
-            raise self._init_error
+            if initial:
+                raise self._init_error
+            print(f"[PlaywrightDriver] 重建失败: {self._init_error}")
+
+    def _recreate(self):
+        """worker 真卡死（_dispatch 超时）后调用：弃旧建新，让 driver 自愈。"""
+        if self._recreating:
+            return
+        self._recreating = True
+        try:
+            print("[PlaywrightDriver] worker 卡死，重建浏览器…")
+            self._start_worker()
+        finally:
+            self._recreating = False
 
     # ── worker thread: owns all Playwright objects ──────────────────
-    def _run(self):
+    def _run(self, cmd_q):
         try:
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
@@ -242,7 +288,7 @@ class PlaywrightDriver:
             return
 
         while True:
-            item = self._cmd_q.get()
+            item = cmd_q.get()       # 本 worker 私有队列（重建后旧 worker 读旧队列、不抢新队列）
             if item is None:
                 break
             fn, holder, ev = item
@@ -317,7 +363,8 @@ class PlaywrightDriver:
             collect = lambda p: new_pages.append(p)
             self._context.on("page", collect)
             try:
-                res = page.evaluate(_build_exec_script(code))
+                # JS 超时设为 execute_js 的 timeout，略小于 _dispatch 的 timeout+15，让 JS 先自拒、worker 不卡
+                res = page.evaluate(_build_exec_script(code, timeout_ms=int(timeout) * 1000))
             finally:
                 try:
                     self._context.remove_listener("page", collect)
@@ -352,7 +399,9 @@ class PlaywrightDriver:
             try:
                 return self._dispatch(job, timeout=timeout + 15)
             except TimeoutError:
-                return {"result": f"No response data in {timeout}s (script may still be running)"}
+                # JS 超时(a)本应在 timeout s 先返回；走到这说明 worker 真卡死 → 重建自愈
+                self._recreate()
+                return {"result": f"No response data in {timeout}s (worker 已重建)"}
             except Exception as e:
                 if _is_navigation_error(str(e)):
                     # page navigated/reloaded mid-execution — mimic TMWebDriver reload semantics
@@ -382,9 +431,7 @@ class PlaywrightDriver:
     def _screenshot(self, msg, default_sid):
         """直接用 playwright 原生 page.screenshot 存合法 PNG（agent 无需手动处理 base64）。
         {"cmd":"screenshot","path":"/data/platform/output/x.png","fullPage":true,"selector":"可选"}"""
-        path = msg.get("path")
-        if not path:
-            raise Exception("screenshot 需要 path（保存路径）")
+        path = _safe_output_path(msg.get("path"))   # 路径白名单，防越界写
         page = self._live_page(str(msg.get("tabId") or default_sid))
         if page is None:
             raise Exception("无可用页面，先用 web_execute_js 导航到目标页")
