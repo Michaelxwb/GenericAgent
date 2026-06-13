@@ -332,6 +332,75 @@ def _clean(t):
     t = re.sub(r'</?summary>', '', t)
     return re.sub(r'\n{3,}', '\n\n', _strip_md(t)).strip()
 
+# ── 定时任务（同步前端，接共享调度循环）──────────────────────────
+# 到点 → put_task → 取 done → bot.send_text(target) 主动推送（context_token 留空即主动发）。
+# GA_PUSH_TARGET 填用户的 wechat uid。
+def _start_wechat_scheduler(bot):
+    from chatapp_common import run_scheduler_loop, scheduled_target
+
+    def make_runner(prompt):
+        target = scheduled_target(prompt)   # 任务自带 [推送目标] 优先，回退 GA_PUSH_TARGET
+        if not target:
+            print('[scheduler] 任务无 [推送目标] 且未配置 GA_PUSH_TARGET，跳过', file=sys.__stdout__)
+            return None
+
+        def run():
+            dq = agent.put_task(prompt, source='wechat', target=target)
+            while True:
+                try:
+                    item = dq.get(True, 3)
+                except queue.Empty:
+                    if not agent.is_running:
+                        return
+                    continue
+                if 'done' in item:
+                    # 只推最终结果：取最后一轮输出，用 _clean 剥 LLM Running/工具调用等流式噪音
+                    outputs = item.get('outputs') or []
+                    result = item.get('done', '')
+                    final = (outputs[-1] if outputs else '') or result
+                    text = _clean(final).strip()
+                    try:
+                        if text:
+                            bot.send_text(target, text[:3000])
+                    except Exception as e:
+                        print(f'[scheduler] WeChat 主动推送失败: {e}', file=sys.__stdout__)
+                    # 补发文件：scheduler 报告路径 + 结果里的 [FILE:...]，都作为附件发出
+                    paths = list(re.findall(r'\[FILE:([^\]]+)\]', result))
+                    rpt = re.search(r'(\S*sche_tasks/done/\S+\.md)', prompt)
+                    if rpt:
+                        paths.append(rpt.group(1))
+                    for p in dict.fromkeys(paths):   # 去重保序
+                        _wx_send_file(bot, target, p.strip())
+                    return
+        return run
+    threading.Thread(target=run_scheduler_loop, args=(make_runner,),
+                     daemon=True, name='ga-scheduler').start()
+
+def _fmt_tool(tc):
+    name = tc.get('tool_name', '?')
+    args = {k: v for k, v in (tc.get('args') or {}).items() if not k.startswith('_')}
+    return f"{name}({str(args)[:120]})"
+
+def _wx_send_file(bot, to_uid, fpath, ctx=''):
+    """按扩展名选 send_image/send_video/send_file，发一个文件。容错不抛。"""
+    if not os.path.isabs(fpath):
+        fpath = os.path.join(_TEMP_DIR, fpath)
+    try:
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(fpath)
+        ext = os.path.splitext(fpath)[1].lower()
+        sender = bot.send_video if ext in {'.mp4', '.mov', '.m4v', '.webm'} else \
+                 bot.send_image if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} else bot.send_file
+        sender(to_uid, fpath, context_token=ctx)
+        print(f'[WX] sent media: {fpath}', file=sys.__stdout__, flush=True)
+        return True
+    except Exception as e:
+        print(f'[WX] send media err: {e}', file=sys.__stdout__, flush=True)
+        return False
+
+if not hasattr(agent, '_turn_end_hooks'):
+    agent._turn_end_hooks = {}
+
 def on_message(bot, msg):
     text = bot.extract_text(msg).strip()
     uid = msg.get('from_user_id', '')
@@ -340,7 +409,7 @@ def on_message(bot, msg):
     if not text and not media_paths: return
     if media_paths:
         text = (text + '\n' if text else '') + '\n'.join(f'[用户发送文件: {p}]' for p in media_paths)
-    print(f'[WX] 收到: {text[:80]}', file=sys.__stdout__)
+    print(f'[WX] 📩 {uid}: {text[:80]}', file=sys.__stdout__, flush=True)
 
     # Commands
     if text in ('/stop', '/abort'):
@@ -363,7 +432,7 @@ def on_message(bot, msg):
 
     def _handle():
         prompt = text if text.startswith('/') else f"If you need to show files to user, use [FILE:filepath] in your response.\n\n{text}"
-        dq = agent.put_task(prompt, source="wechat")
+        dq = agent.put_task(prompt, source="wechat", target=uid)
         _typing_stop = threading.Event()
         def _keep_typing():
             ticket = bot.get_typing_ticket(uid, ctx)
@@ -373,7 +442,7 @@ def on_message(bot, msg):
                 except: pass
                 _typing_stop.wait(2.0)
         threading.Thread(target=_keep_typing, daemon=True).start()
-        result = ''; sent = 0; mi = 0; last_send = 0; item = {}
+        item = {}
         def _wx_send(text):
             s = text.strip(); t0 = time.time()
             try:
@@ -383,48 +452,56 @@ def on_message(bot, msg):
             except Exception as e:
                 print(f'[WX] send err len={len(s)} dt={time.time()-t0:.1f}s {type(e).__name__}: {e}', file=sys.__stdout__)
                 return False
-        def _send(show):
-            nonlocal mi, last_send
-            now = time.time()
-            if mi >= 9 or not show.strip(): return False
-            if mi and now - last_send < 6 * mi: return None
-            if _wx_send(show[:3000]): mi += 1; last_send = time.time(); return True
-            return False
-        try:
-            done = []; turn = 1
+        # 非阻塞发送：hook 只入队（瞬时），单独发送线程按序发，绝不阻塞 agent 轮次线程。
+        _send_q = queue.Queue()
+        def _sender_loop():
             while True:
-                item = dq.get(timeout=300)
-                if 'done' in item: break
-                if item.get('turn', turn) > turn:
-                    outputs = item.get('outputs', [])
-                    lastdone = outputs[-2] if len(outputs) >= 2 else ''
-                    turn = item['turn']; done.append(lastdone)
-                if len(done) > sent:
-                    merged = _clean('\n\n'.join(done[sent:]))
-                    print(f'[WX] turns={len(done)}/{len(done)+1} sent={sent} sending={len(done)-sent}', file=sys.__stdout__)
-                    if _send(merged): sent = len(done)
-        except queue.Empty: result = '[超时]'
-        _typing_stop.set()
-
-        if 'done' in item: result, done = item['done'], item.get('outputs', [])
-        aborted = _task_aborted.pop(uid, False)
-        tag = '[已停止]' if aborted else '[任务已完成]'
-        rest = _clean('\n\n'.join(done[sent:] + ['\n\n' + tag]).strip())
-        if rest: _wx_send(rest[-3000:])
-
-        files = re.findall(r'\[FILE:([^\]]+)\]', result)
-        bad = {'filepath', '<filepath>', 'path', '<path>', 'file_path', '<file_path>', '...'}
-        files = [f for f in files if f.strip().lower() not in bad and (f if os.path.isabs(f) else os.path.join(_TEMP_DIR, f)) not in media_paths]
-        for fpath in set(files):
-            if not os.path.isabs(fpath): fpath = os.path.join(_TEMP_DIR, fpath)
+                m = _send_q.get()
+                if m is None: break
+                _wx_send(m)
+        _sender = threading.Thread(target=_sender_loop, daemon=True); _sender.start()
+        # 进度流（对齐企微）：turn-end hook 每轮推 "⏳ Turn N: 摘要 + 🛠 工具"，长任务可见在干活。
+        hook_key = f'wechat_{uid}'
+        def _on_turn(c):
             try:
-                if not os.path.exists(fpath): raise FileNotFoundError(f"文件不存在: {fpath}")
-                ext = os.path.splitext(fpath)[1].lower()
-                sender = bot.send_video if ext in {'.mp4', '.mov', '.m4v', '.webm'} else \
-                         bot.send_image if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} else bot.send_file
-                sender(uid, fpath, context_token=ctx)
-                print(f'[WX] sent media: {fpath}', file=sys.__stdout__)
-            except Exception as e: print(f'[WX] send media err: {e}', file=sys.__stdout__)
+                if c.get('exit_reason'): return
+                summary = c.get('summary')
+                if not summary: return
+                parts = [f"⏳ Turn {c.get('turn', '?')}: {summary}"]
+                tools = c.get('tool_calls') or []
+                if tools:
+                    parts.append('🛠 ' + ', '.join(_fmt_tool(tc) for tc in tools[:3]))
+                _send_q.put('\n'.join(parts))   # 非阻塞入队，不等 HTTP
+            except Exception as e:
+                print(f'[WX hook] {e}', file=sys.__stdout__)
+        agent._turn_end_hooks[hook_key] = _on_turn
+        try:
+            while 'done' not in (item := dq.get(timeout=300)):
+                pass
+        except queue.Empty:
+            item = {}
+        finally:
+            agent._turn_end_hooks.pop(hook_key, None)
+            _typing_stop.set()
+
+        # 最终答案：取最后一轮输出（等价企微 resp.content），_clean 去噪
+        result = item.get('done', '')
+        outputs = item.get('outputs', [])
+        aborted = _task_aborted.pop(uid, False)
+        final = _clean((outputs[-1] if outputs else '') or result).strip()
+        if aborted:
+            final = (final + '\n\n⏹️ [已停止]').strip()
+        if final:
+            _send_q.put(final[-3000:])     # 走同一队列，排在进度之后
+        _send_q.put(None)
+        _sender.join(timeout=120)          # 等文本按序发完，再发文件
+
+        bad = {'filepath', '<filepath>', 'path', '<path>', 'file_path', '<file_path>', '...'}
+        files = [f for f in re.findall(r'\[FILE:([^\]]+)\]', result)
+                 if f.strip().lower() not in bad
+                 and (f if os.path.isabs(f) else os.path.join(_TEMP_DIR, f)) not in media_paths]
+        for fpath in dict.fromkeys(files):
+            _wx_send_file(bot, uid, fpath.strip(), ctx)
 
     threading.Thread(target=_handle, daemon=True).start()
 
@@ -446,6 +523,7 @@ if __name__ == '__main__':
         finally:
             sys.stdout = sys.stderr = _logf
     threading.Thread(target=agent.run, daemon=True).start()
+    _start_wechat_scheduler(bot)   # 定时任务（同步前端）
     print(f'WeChat Bot 已启动 (bot_id={bot.bot_id})', file=sys.__stdout__)
     try:
         bot.run_loop(on_message)

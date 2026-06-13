@@ -117,12 +117,17 @@ class WeComApp(AgentChatMixin):
 
     # ── send ────────────────────────────────────────────────────────
     async def send_text(self, chat_id, content, frame=None, **_):
+        if not self.client:
+            return
         # frame 显式传入时回复到该任务的原始消息帧；否则回退最新帧。
         frame = frame or self.chat_frames.get(chat_id)
-        if not self.client or frame is None:
-            return
-        for part in split_text(content, self.split_limit):
-            await self.client.reply_stream(frame, generate_req_id("stream"), part, finish=True)
+        if frame is not None:
+            for part in split_text(content, self.split_limit):
+                await self.client.reply_stream(frame, generate_req_id("stream"), part, finish=True)
+        else:
+            # 无回复帧（定时任务等主动推送）→ 主动发送到 chat_id（单聊填用户 userid）
+            for part in split_text(content, self.split_limit):
+                await self.client.send_message(chat_id, {"msgtype": "markdown", "markdown": {"content": part}})
 
     async def send_media(self, chat_id, file_path, frame=None):
         if not self.client or not os.path.isfile(file_path):
@@ -159,15 +164,16 @@ class WeComApp(AgentChatMixin):
             await self.send_media(chat_id, fp, frame=frame)
 
     # ── agent execution (single-channel via turn hook) ──────────────
-    async def run_agent(self, chat_id, text, frame=None, **_):
+    async def run_agent(self, chat_id, text, frame=None, quiet=False, **_):
         # 串行化同一会话：上一个任务的回复全部发完再开下一个，避免消息交错串台。
         # 锁内捕获 frame，整段任务都回复到这条原始消息，不受后续新消息刷新影响。
-        if frame is None:
+        # quiet=True（定时任务）：frame 保持 None → send_text 走主动推送，且不刷进度。
+        if frame is None and not quiet:
             frame = self.chat_frames.get(chat_id)
         async with self._chat_lock(chat_id):
-            await self._execute_agent(chat_id, text, frame)
+            await self._execute_agent(chat_id, text, frame, quiet=quiet)
 
-    async def _execute_agent(self, chat_id, text, frame):
+    async def _execute_agent(self, chat_id, text, frame, quiet=False):
         state = {"running": True}
         self.user_tasks[chat_id] = state
         done_event = threading.Event()
@@ -184,6 +190,8 @@ class WeComApp(AgentChatMixin):
                     result["summary"] = ctx.get("summary")
                     done_event.set()
                     return
+                if quiet:        # 定时任务：只取最终结果，不逐轮推进度
+                    return
                 summary = ctx.get("summary")
                 if not summary:
                     return
@@ -199,9 +207,10 @@ class WeComApp(AgentChatMixin):
                 traceback.print_exc()
 
         try:
-            await self.send_text(chat_id, "🤔 思考中...", frame=frame)
+            if not quiet:
+                await self.send_text(chat_id, "🤔 思考中...", frame=frame)
             self._register_hook(hook_key, _on_turn)
-            self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
+            self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source, target=chat_id)
 
             # Wait for: hook signals done / user stops / agent crashes
             t0 = time.time()
@@ -284,7 +293,9 @@ class WeComApp(AgentChatMixin):
                 print(f"[WeCom] welcome error: {e}")
 
     async def on_connected(self, *_):     _tprint("[WeCom] connected")
-    async def on_authenticated(self, *_): _tprint("[WeCom] authenticated, 等待消息中...\n")
+    async def on_authenticated(self, *_):
+        _tprint("[WeCom] authenticated, 等待消息中...\n")
+        self.start_scheduler()   # 事件循环已就绪，启动定时任务轮询（通道无关，定义在 AgentChatMixin）
     async def on_disconnected(self, *_):  _tprint("[WeCom] disconnected")
     async def on_error(self, frame):     _tprint(f"[WeCom] error: {frame}")
 

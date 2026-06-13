@@ -110,9 +110,12 @@ class GenericAgent:
         self.stop_sig = True
         if self.handler is not None: self.handler.code_stop_signal.append(1)
             
-    def put_task(self, query, source="user", images=None):
+    def put_task(self, query, source="user", images=None, target=None):
+        # target：本次任务的来源用户标识（IM uid）。随任务入队，供 do_file_write 给
+        # 定时任务 JSON 自动盖 target（谁创建谁接收推送）。
         display_queue = queue.Queue()
-        self.task_queue.put({"query": query, "source": source, "images": images or [], "output": display_queue})
+        self.task_queue.put({"query": query, "source": source, "images": images or [],
+                             "output": display_queue, "target": target})
         return display_queue
 
     # i know it is dangerous, but raw_query is dangerous enough it doesn't enlarge
@@ -136,6 +139,7 @@ class GenericAgent:
             task = self.task_queue.get()
             if isinstance(task, str): break
             raw_query, source, display_queue = task["query"], task["source"], task["output"]
+            self.current_target = task.get("target")   # 供 do_file_write 给定时任务盖 target
             raw_query = self._handle_slash_cmd(raw_query, display_queue)
             if raw_query is None:
                 self.task_queue.task_done(); continue

@@ -422,6 +422,17 @@ class GenericAgentHandler(BaseHandler):
         if not content:
             yield f"[Status] ❌ 失败: 未在回复中找到<file_content>代码块内容\n"
             return StepOutcome({"status": "error", "msg": "No content found. Blank is not supported. Put content inside <file_content>...</file_content> tags in your reply body before call file_write."}, next_prompt="\n")
+        # 定时任务定义文件：强制盖上 target=当前用户（谁创建谁接收推送），不靠 agent 自觉。
+        if '/sche_tasks/' in path.replace('\\', '/') and path.endswith('.json'):
+            tgt = getattr(getattr(self, 'parent', None), 'current_target', None)
+            if tgt:
+                try:
+                    obj = json.loads(content)
+                    if isinstance(obj, dict) and not obj.get('target'):
+                        obj['target'] = tgt
+                        content = json.dumps(obj, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
         try:
             new_content = expand_file_refs(content, base_dir=self.cwd)
             if mode == "prepend":

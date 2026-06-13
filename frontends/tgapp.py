@@ -22,6 +22,8 @@ from chatapp_common import (
     format_restore,
     redirect_log,
     require_runtime,
+    run_scheduler_loop,
+    scheduled_target,
     split_text,
 )
 from continue_cmd import handle_frontend_command, reset_conversation
@@ -861,6 +863,45 @@ def _cancel_stream_task(ctx):
 async def _sync_commands(application):
     await application.bot.set_my_commands([BotCommand(command, description) for command, description in TELEGRAM_MENU_COMMANDS])
 
+# ── 定时任务：执行 + 主动推送（tgapp 不走 AgentChatMixin，单独接共享调度循环）──
+# 未实测：当前无 TG 部署实例。GA_PUSH_TARGET 填目标 chat id（数字）或 @username。
+async def _run_scheduled_tg(application, target, prompt):
+    dq = agent.put_task(prompt, source="telegram", target=target)
+    while True:
+        try:
+            item = await asyncio.to_thread(dq.get, True, 3)
+        except Q.Empty:
+            if not agent.is_running:
+                return
+            continue
+        if "done" in item:
+            text = (item.get("done") or "")[:4000]
+            chat = int(target) if target.lstrip("-").isdigit() else target
+            try:
+                await application.bot.send_message(chat_id=chat, text=text)
+            except Exception as e:
+                print(f"[scheduler] TG 主动推送失败: {e}")
+            return
+
+def _start_tg_scheduler(application, loop):
+    def make_runner(prompt):
+        target = scheduled_target(prompt)   # 任务自带 [推送目标] 优先，回退 GA_PUSH_TARGET
+        if not target:
+            print("[scheduler] 任务无 [推送目标] 且未配置 GA_PUSH_TARGET，跳过（无法主动推送）")
+            return None
+
+        def run():
+            fut = asyncio.run_coroutine_threadsafe(
+                _run_scheduled_tg(application, target, prompt), loop)
+            fut.result()
+        return run
+    threading.Thread(target=run_scheduler_loop, args=(make_runner,),
+                     daemon=True, name="ga-scheduler").start()
+
+async def _post_init(application):
+    await _sync_commands(application)
+    _start_tg_scheduler(application, asyncio.get_running_loop())
+
 async def _reply_command_text(message, text):
     for segment in _markdown_safe_segments(text) or ["..."]:
         try:
@@ -896,7 +937,7 @@ async def handle_msg(update, ctx):
     if ALLOWED and uid not in ALLOWED:
         return await update.message.reply_text("no")
     prompt = _build_text_prompt(update.message.text)
-    dq = agent.put_task(prompt, source="telegram")
+    dq = agent.put_task(prompt, source="telegram", target=update.effective_user.id)
     task = asyncio.create_task(_stream(dq, update.message))
     ctx.user_data['stream_task'] = task
 
@@ -1123,7 +1164,7 @@ if __name__ == '__main__':
                 request_kwargs['proxy'] = proxy
             request = HTTPXRequest(**request_kwargs)
             app = (ApplicationBuilder().token(mykeys['tg_bot_token'])
-                   .request(request).get_updates_request(request).post_init(_sync_commands).build())
+                   .request(request).get_updates_request(request).post_init(_post_init).build())
             app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
             app.add_handler(CallbackQueryHandler(handle_llm_callback, pattern=r"^llm:"))
             app.add_handler(MessageHandler(filters.COMMAND, handle_command))

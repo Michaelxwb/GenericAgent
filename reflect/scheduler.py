@@ -122,8 +122,11 @@ def check():
         ts = now.strftime('%Y-%m-%d_%H%M')
         rpt = os.path.join(DONE, f'{ts}_{tid}.md')
         prompt = task.get('prompt', '')
+        target = task.get('target', '')
+        target_line = f'[推送目标] {target}\n' if target else ''
         return (f'[定时任务] {tid}\n'
-                f'[报告路径] {rpt}\n\n'
+                f'[报告路径] {rpt}\n'
+                f'{target_line}\n'
                 f'先读 scheduled_task_sop 了解执行流程，然后执行以下任务：\n\n'
                 f'{prompt}\n\n'
                 f'完成后将执行报告写入 {rpt}。')

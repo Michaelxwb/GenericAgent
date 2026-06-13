@@ -1,4 +1,4 @@
-import ast, asyncio, glob, json, os, queue as Q, re, socket, sys, time
+import ast, asyncio, glob, json, os, queue as Q, re, socket, sys, threading, time
 
 # 确保能导入上级目录的模块（如 agentmain）
 _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -254,6 +254,54 @@ def redirect_log(script_file, log_name, label, allowed):
     print(f"[{label}] allow list: {allowed_label(allowed)}")
 
 
+def scheduled_target(prompt):
+    """从定时任务 prompt 提取 [推送目标]（创建者 uid）；无则回退 GA_PUSH_TARGET env。"""
+    m = re.search(r'\[推送目标\]\s*(\S+)', prompt or '')
+    return (m.group(1) if m else '') or os.environ.get('GA_PUSH_TARGET', '').strip()
+
+
+def _load_scheduler():
+    """加载 reflect/scheduler.py（GA root 下）。check() 返回到点任务 prompt 或 None。"""
+    import importlib.util
+    ga_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p = os.path.join(ga_root, "reflect", "scheduler.py")
+    if not os.path.exists(p):
+        print(f"[scheduler] 未找到 {p}")
+        return None
+    spec = importlib.util.spec_from_file_location("ga_scheduler", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def run_scheduler_loop(make_runner, label="scheduler"):
+    """通道无关的定时任务轮询线程主体（在后台线程跑，支持 async/sync 两类前端）。
+
+    每 60s 调 scheduler.check()，到点 → make_runner(prompt) 返回一个无参 runner（同步执行
+    该任务，含投递），None 表示跳过（如未配置推送目标）。runner() 在本线程**同步阻塞至完成**
+    再进入下一轮 —— 天然串行、不会在报告写盘前重复触发，无需额外去重。
+    async 前端的 runner 用 run_coroutine_threadsafe(...).result() 把协程跑完再返回。
+    """
+    try:
+        sched = _load_scheduler()
+    except Exception as e:
+        print(f"[{label}] 加载失败: {e}")
+        return
+    if sched is None:
+        return
+    print(f"[{label}] 定时任务轮询已启动（每 60s）")
+    while True:
+        try:
+            prompt = sched.check()
+            if prompt:
+                runner = make_runner(prompt)
+                if runner is not None:
+                    runner()
+        except Exception as e:
+            print(f"[{label}] tick error: {e}")
+        time.sleep(60)
+
+
 class AgentChatMixin:
     label = "Chat"
     source = "chat"
@@ -316,18 +364,20 @@ class AgentChatMixin:
             return await self.run_agent(chat_id, cmd, **ctx)
         return await self.send_text(chat_id, HELP_TEXT, **ctx)
 
-    async def run_agent(self, chat_id, text, **ctx):
+    async def run_agent(self, chat_id, text, quiet=False, **ctx):
+        # quiet=True：定时任务等主动场景，只推最终结果，不刷“思考中/还在处理中”。
         state = {"running": True}
         self.user_tasks[chat_id] = state
         try:
-            await self.send_text(chat_id, "思考中...", **ctx)
-            dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
+            if not quiet:
+                await self.send_text(chat_id, "思考中...", **ctx)
+            dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source, target=chat_id)
             last_ping = time.time()
             while state["running"]:
                 try:
                     item = await asyncio.to_thread(dq.get, True, 3)
                 except Q.Empty:
-                    if self.agent.is_running and time.time() - last_ping > self.ping_interval:
+                    if not quiet and self.agent.is_running and time.time() - last_ping > self.ping_interval:
                         await self.send_text(chat_id, "⏳ 还在处理中，请稍等...", **ctx)
                         last_ping = time.time()
                     continue
@@ -343,6 +393,36 @@ class AgentChatMixin:
             await self.send_text(chat_id, f"❌ 错误: {e}", **ctx)
         finally:
             self.user_tasks.pop(chat_id, None)
+
+    # ── 定时任务调度（通道无关）─────────────────────────────────────
+    # reflect/scheduler.py 的 check() 每次返回一个到点任务的 prompt（或 None）。
+    # 到点 → run_agent(target, prompt, quiet=True)，结果经 send_text 主动推送
+    #（target 无回复上下文 → 各通道 send_text 走主动发送分支）。
+    def start_scheduler(self):
+        """前端在事件循环就绪后调用一次。到点任务 → run_agent(target, quiet) 主动推送。"""
+        if getattr(self, "_scheduler_started", False):
+            return
+        self._scheduler_started = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            print("[scheduler] 无运行中的事件循环，调度未启动")
+            return
+
+        def make_runner(prompt):
+            target = scheduled_target(prompt)   # 任务自带 [推送目标] 优先，回退 GA_PUSH_TARGET
+            if not target:
+                print("[scheduler] 任务无 [推送目标] 且未配置 GA_PUSH_TARGET，跳过（无法主动推送）")
+                return None
+
+            def run():
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.run_agent(target, prompt, quiet=True), loop)
+                fut.result()   # 阻塞至任务完成，保证串行、不重复触发
+            return run
+
+        threading.Thread(target=run_scheduler_loop, args=(make_runner,),
+                         daemon=True, name="ga-scheduler").start()
 
 
 from agentmain import GeneraticAgent as _GA
