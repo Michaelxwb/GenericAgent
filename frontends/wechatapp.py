@@ -428,6 +428,13 @@ def on_message(bot, msg):
         _task_aborted[uid] = True
         print(f'[WX] /stop set _task_aborted[{uid}]', file=sys.__stdout__)
         return
+    if text in ('/new', '/clear', '/reset'):
+        from continue_cmd import reset_conversation
+        agent.abort()
+        msg = reset_conversation(agent)   # 真正清空历史（之前漏处理，/new 只被 LLM 顺口回了句）
+        bot.send_text(uid, msg, context_token=ctx)
+        print(f'[WX] /new reset conversation for {uid}', file=sys.__stdout__, flush=True)
+        return
     if text.startswith('/llm'):
         args = text.split()
         if len(args) > 1:
