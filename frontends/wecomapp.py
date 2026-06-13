@@ -66,8 +66,16 @@ class WeComApp(AgentChatMixin):
         self._allowed = ALLOWED
         self.client = None
         self.chat_frames = {}       # chat_id → latest frame (for reply)
+        self._chat_locks = {}       # chat_id → asyncio.Lock，串行化同会话任务，避免回复交错
         self._seen = deque(maxlen=1000)
         self._stats = {"received": 0, "completed": 0}
+
+    def _chat_lock(self, chat_id):
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
 
     # ── hook management ──────────────────────────────────────────────
     def _register_hook(self, key: str, fn: TurnHookFn) -> None:
@@ -108,14 +116,15 @@ class WeComApp(AgentChatMixin):
         return path
 
     # ── send ────────────────────────────────────────────────────────
-    async def send_text(self, chat_id, content, **_):
-        if not self.client or chat_id not in self.chat_frames:
+    async def send_text(self, chat_id, content, frame=None, **_):
+        # frame 显式传入时回复到该任务的原始消息帧；否则回退最新帧。
+        frame = frame or self.chat_frames.get(chat_id)
+        if not self.client or frame is None:
             return
-        frame = self.chat_frames[chat_id]
         for part in split_text(content, self.split_limit):
             await self.client.reply_stream(frame, generate_req_id("stream"), part, finish=True)
 
-    async def send_media(self, chat_id, file_path):
+    async def send_media(self, chat_id, file_path, frame=None):
         if not self.client or not os.path.isfile(file_path):
             return
         ext = os.path.splitext(file_path)[1].lower()
@@ -124,7 +133,7 @@ class WeComApp(AgentChatMixin):
             data = f.read()
         try:
             result = await self.client.upload_media(data, type=media_type, filename=os.path.basename(file_path))
-            frame = self.chat_frames.get(chat_id)
+            frame = frame or self.chat_frames.get(chat_id)
             if frame:
                 await self.client.reply_media(frame, media_type, result["media_id"])
             else:
@@ -132,25 +141,33 @@ class WeComApp(AgentChatMixin):
             _tprint(f"[{_ts()}] 📤 Sent {media_type}: {os.path.basename(file_path)}")
         except Exception as e:
             print(f"[WeCom] send_media error: {e}")
-            await self.send_text(chat_id, f"📎 {os.path.basename(file_path)}（发送失败: {e}）")
+            await self.send_text(chat_id, f"📎 {os.path.basename(file_path)}（发送失败: {e}）", frame=frame)
 
-    async def send_done(self, chat_id, raw_text):
+    async def send_done(self, chat_id, raw_text, frame=None):
         """Send final result: text + extracted file attachments."""
         files = extract_files(raw_text)
         if not files:
-            return await self.send_text(chat_id, build_done_text(raw_text))
+            return await self.send_text(chat_id, build_done_text(raw_text), frame=frame)
         clean = clean_reply(strip_files(raw_text))
         if clean and clean != "...":
-            await self.send_text(chat_id, clean)
+            await self.send_text(chat_id, clean, frame=frame)
         for fp in files:
             if not os.path.isabs(fp) and not os.path.isfile(fp):
                 resolved = os.path.join(TEMP_DIR, fp)
                 if os.path.isfile(resolved):
                     fp = resolved
-            await self.send_media(chat_id, fp)
+            await self.send_media(chat_id, fp, frame=frame)
 
     # ── agent execution (single-channel via turn hook) ──────────────
-    async def run_agent(self, chat_id, text, **_):
+    async def run_agent(self, chat_id, text, frame=None, **_):
+        # 串行化同一会话：上一个任务的回复全部发完再开下一个，避免消息交错串台。
+        # 锁内捕获 frame，整段任务都回复到这条原始消息，不受后续新消息刷新影响。
+        if frame is None:
+            frame = self.chat_frames.get(chat_id)
+        async with self._chat_lock(chat_id):
+            await self._execute_agent(chat_id, text, frame)
+
+    async def _execute_agent(self, chat_id, text, frame):
         state = {"running": True}
         self.user_tasks[chat_id] = state
         done_event = threading.Event()
@@ -176,13 +193,13 @@ class WeComApp(AgentChatMixin):
                 if tools:
                     parts.append(f"🛠 {', '.join(_fmt_tool(tc) for tc in tools[:3])}")
                 _tprint(f"[{_ts()}] {parts[0]}")
-                asyncio.run_coroutine_threadsafe(self.send_text(chat_id, "\n".join(parts)), loop)
+                asyncio.run_coroutine_threadsafe(self.send_text(chat_id, "\n".join(parts), frame=frame), loop)
             except Exception as e:
                 print(f"[WeCom hook] {e}")
                 traceback.print_exc()
 
         try:
-            await self.send_text(chat_id, "🤔 思考中...")
+            await self.send_text(chat_id, "🤔 思考中...", frame=frame)
             self._register_hook(hook_key, _on_turn)
             self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
 
@@ -198,18 +215,18 @@ class WeComApp(AgentChatMixin):
 
             if result.get("raw") is not None:
                 self._stats["completed"] += 1
-                await self.send_done(chat_id, result["raw"])
+                await self.send_done(chat_id, result["raw"], frame=frame)
                 label = result.get("summary") or f'{len(result["raw"])} 字'
                 _tprint(f"[{_ts()}] ✅ Done ({chat_id}) — {label}")
             elif not state["running"]:
                 _tprint(f"[{_ts()}] ⏹️ 停止 ({chat_id})")
-                await self.send_text(chat_id, "⏹️ 已停止")
+                await self.send_text(chat_id, "⏹️ 已停止", frame=frame)
             else:
                 _tprint(f"[{_ts()}] ⚠️ 异常退出 ({chat_id})")
-                await self.send_text(chat_id, "⚠️ Agent 异常退出，请重试")
+                await self.send_text(chat_id, "⚠️ Agent 异常退出，请重试", frame=frame)
         except Exception as e:
             traceback.print_exc()
-            await self.send_text(chat_id, f"❌ 错误: {e}")
+            await self.send_text(chat_id, f"❌ 错误: {e}", frame=frame)
         finally:
             self._unregister_hook(hook_key)
             self.user_tasks.pop(chat_id, None)
@@ -227,7 +244,8 @@ class WeComApp(AgentChatMixin):
         if content.startswith("/"):
             _tprint(f"[{_ts()}] 🔧 命令 {content} from {sender_id}")
             return await self.handle_command(chat_id, content)
-        asyncio.create_task(self.run_agent(chat_id, content))
+        # 绑定当前帧：整个任务都回复到这条消息，不被后续新消息刷新
+        asyncio.create_task(self.run_agent(chat_id, content, frame=frame))
 
     async def _on_media(self, frame, key, icon):
         """Common handler for image/file messages."""
@@ -246,10 +264,10 @@ class WeComApp(AgentChatMixin):
             _tprint(f"[{_ts()}] {icon} {key.title()} from {sender_id}" + (f": {fname}" if fname else ""))
             path = await self._save_media(url, info.get("aeskey", ""), default)
             label = "一张图片" if key == "image" else f"文件 {os.path.basename(path)}"
-            asyncio.create_task(self.run_agent(chat_id, f"[用户发送了{label}，已保存到: {path}]"))
+            asyncio.create_task(self.run_agent(chat_id, f"[用户发送了{label}，已保存到: {path}]", frame=frame))
         except Exception as e:
             print(f"[WeCom] on_{key} error: {e}")
-            await self.send_text(chat_id, f"❌ {key}处理失败: {e}")
+            await self.send_text(chat_id, f"❌ {key}处理失败: {e}", frame=frame)
 
     async def on_image(self, frame):
         await self._on_media(frame, "image", "🖼️")
@@ -272,12 +290,23 @@ class WeComApp(AgentChatMixin):
 
     # ── Terminal CLI (runs in background thread) ─────────────────────
     def _terminal_loop(self):
-        """Blocking CLI loop — run in a daemon thread."""
+        """Blocking CLI loop — run in a daemon thread.
+
+        Non-interactive (detached container, EOF stdin): the loop is useless and
+        select()+readline() would busy-spin at ~100% CPU on EOF. Skip it entirely.
+        """
+        stdin = getattr(sys, "stdin", None)
+        if stdin is None or not getattr(stdin, "isatty", lambda: False)():
+            _tprint("[WeCom] 非交互式环境（无 tty），终端命令循环已停用")
+            return
         while True:
             try:
                 if not select.select([sys.stdin], [], [], 1.0)[0]:
                     continue
-                cmd = sys.stdin.readline().strip().lower()
+                line = sys.stdin.readline()
+                if line == "":          # EOF：stdin 关闭，避免空读忙等
+                    break
+                cmd = line.strip().lower()
             except Exception:
                 break
             if not cmd:

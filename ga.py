@@ -104,15 +104,46 @@ def ask_user(question, candidates=None):
 
 import simphtml
 driver = None
+
+def _open_browser(url):
+    """跨平台打开浏览器（os.startfile 仅 Windows 有，Linux 容器会 AttributeError 崩溃）。"""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(url)  # noqa: 仅 Windows
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", url])
+        else:
+            subprocess.Popen(["xdg-open", url])
+    except Exception as e:
+        print(f"[GA] 无法自动打开浏览器 {url}: {e}")
+
+def _prefer_playwright():
+    """选择浏览器后端：显式 env 优先，否则 headless Linux（无 DISPLAY，典型容器）用 playwright。"""
+    backend = os.environ.get("GA_BROWSER_BACKEND", "").strip().lower()
+    if backend == "playwright":
+        return True
+    if backend in ("tmwd", "userscript", "cdp"):
+        return False
+    return sys.platform.startswith("linux") and not os.environ.get("DISPLAY")
+
 def first_init_driver():
     global driver
+    if _prefer_playwright():
+        from playwright_driver import PlaywrightDriver
+        driver = PlaywrightDriver(
+            headless=os.environ.get("GA_BROWSER_HEADLESS", "1") != "0",
+            storage_state=(os.environ.get("GA_BROWSER_STORAGE_STATE")
+                           or os.environ.get("PLATFORM_COMMAND_STORAGE_STATE")),
+            start_url=os.environ.get("GA_BROWSER_START_URL", "about:blank"),
+        )
+        return
     from TMWebDriver import TMWebDriver
     driver = TMWebDriver()
     for i in range(7):
         time.sleep(2)
         sess = driver.get_all_sessions()
         if len(sess) > 0: break
-        if i == 4: webbrowser.open("https://example.com")
+        if i == 4: _open_browser("https://example.com")
 
 def web_scan(tabs_only=False, switch_tab_id=None, text_only=False, maxlen=35000):
     """获取当前页面的简化HTML内容和标签页列表。注意：简化过程会过滤边栏、浮动元素等非主体内容。
