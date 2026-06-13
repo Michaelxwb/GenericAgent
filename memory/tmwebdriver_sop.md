@@ -1,8 +1,11 @@
 # TMWebDriver SOP
 
 - 直接用web_scan/web_execute_js工具。本文件只记录特性和坑。
-- 底层：`../TMWebDriver.py`通过Chrome扩展接管用户浏览器（保留登录态/Cookie）
-- 非Selenium/Playwright，保留用户浏览器登录态
+- **两种后端**（由 `ga.first_init_driver` 按环境自动选，对工具透明）：
+  - **PlaywrightDriver**（容器/headless 默认，无 DISPLAY 时）：容器内自带 headless Chromium，登录态走 `storageState`。**无浏览器扩展、无桌面**。
+  - **TMWebDriver**（桌面，有 DISPLAY 或 `GA_BROWSER_BACKEND=tmwd`）：通过 Chrome 扩展接管用户真实浏览器，保留登录态/Cookie。
+- 下方 CDP/元命令配方（`{"cmd":"cdp|tabs|cookies|batch"}`、`Page.captureScreenshot`、`DOM.*`、CDP 点击等）**两种后端通用**——playwright 经 `new_cdp_session` 透传同样的 CDP 命令。
+- 标注 **[仅 TMWebDriver]** 的段落只适用扩展/桌面后端，playwright 后端不适用。
 
 ## 通用特性
 - ⚠web_execute_js里使用`await`时需**显式`return`**才能拿到返回值（底层async包裹，不写return则返回null）
@@ -13,7 +16,7 @@
 - ⚠JS点击按钮打不开新tab→可能是浏览器弹窗拦截，换CDP点击试试
 - Vue3自定义组件(Select/Dropdown)：⭐优先vnode实例调用(无视口限制)→见**vue3_component_sop**；CDP坐标点击仅适合选项少且可见的场景
 - 文件上传：⭐首选**DataTransfer API**（纯JS，无CDP依赖）：`new File([content],name,{type}) → new DataTransfer().items.add(file) → input.files=dt.files → dispatch input+change`；CDP `DOM.setFileInputFiles` 在tmwd桥环境nodeId跨调用失效，不推荐；备选ljqCtrl物理点击
-- 需转物理坐标时：`physX = (screenX + rect中心x) * dpr`，`physY = (screenY + chromeH + rect中心y) * dpr`；其中 `chromeH = outerHeight - innerHeight`
+- **[仅 TMWebDriver]** 需转物理坐标时（ljqCtrl 物理点击，依赖桌面屏幕）：`physX = (screenX + rect中心x) * dpr`，`physY = (screenY + chromeH + rect中心y) * dpr`；其中 `chromeH = outerHeight - innerHeight`。playwright headless 无物理屏，用 CDP `Input.dispatchMouseEvent`（视口坐标=getBoundingClientRect）
 
 ## 导航
 - `web_scan` 仅读当前页不导航，切换网站用 `web_execute_js` + `location.href='url'`
@@ -40,10 +43,10 @@ fetch('PDF_URL').then(r=>r.blob()).then(b=>{
 - 后台标签中`setTimeout`被Chrome intensive throttling延迟到≥1min/次，扩展脚本中避免依赖setTimeout轮询
 - 某些SPA页面需CDP `Page.bringToFront`切到前台才会加载数据
 
-## CDP桥(tmwd_cdp_bridge扩展) ⭐首选
-扩展路径：`assets/tmwd_cdp_bridge/`(需安装，含debugger权限)
-⚠TID约定标识：首次运行自动生成到`assets/tmwd_cdp_bridge/config.js`(已gitignore)，扩展通过manifest引用
-调用：`web_execute_js` script直传JSON字符串（工具层自动识别对象格式，走WS→background.js cmd路由）
+## CDP 元命令 ⭐首选（两后端通用）
+- **PlaywrightDriver**：driver 内 `context.new_cdp_session(page)` 透传 CDP，无需扩展，开箱即用
+- **[仅 TMWebDriver]** 走 Chrome 扩展 `assets/tmwd_cdp_bridge/`(需安装，含debugger权限)；⚠TID约定标识首次运行生成到 `config.js`(已gitignore)，扩展通过manifest引用
+调用（两后端一致）：`web_execute_js` script直传JSON字符串（工具层自动识别对象格式并路由到 cdp/tabs/cookies/batch）
 ```js
 // 直接传JSON字符串作为script参数，无需DOM操作
 web_execute_js script='{"cmd": "cookies"}'
@@ -52,13 +55,14 @@ web_execute_js script='{"cmd": "cdp", "tabId": N, "method": "...", "params": {..
 web_execute_js script='{"cmd": "batch", "commands": [...]}'
 // 返回值直接是JSON结果
 ```
-通信方式：⭐JSON字符串直传(首选) | TID DOM方式(TID元素+MutationObserver，web_scan/execute_js底层依赖)
-单命令：`{cmd:'tabs'}` | `{cmd:'cookies'}` | `{cmd:'cdp', tabId:N, method:'...', params:{...}}` | `{cmd:'management', method:'list|reload|disable|enable', extId:'...'}`
-- management：list返回所有扩展信息；reload/disable/enable需传extId
-- contentSettings：`{cmd:'contentSettings', type:'automaticDownloads', pattern:'https://*/*', setting:'allow'}`
+通信方式：⭐JSON字符串直传(首选，两后端通用) | **[仅 TMWebDriver]** TID DOM方式(TID元素+MutationObserver，扩展底层依赖)
+单命令：`{cmd:'tabs'}` | `{cmd:'cookies'}` | `{cmd:'cdp', tabId:N, method:'...', params:{...}}`（三者两后端通用）
+- **[仅 TMWebDriver]** `{cmd:'management', method:'list|reload|disable|enable', extId:'...'}`：扩展管理；playwright 后端无扩展，调用会报不支持
+  - management：list返回所有扩展信息；reload/disable/enable需传extId
+- **[仅 TMWebDriver]** `{cmd:'contentSettings', type:'automaticDownloads', pattern:'https://*/*', setting:'allow'}`：扩展专用；playwright 后端不支持
   - 绕过Chrome"下载多个文件"对话框（该对话框会阻塞整个浏览器JS执行）
   - type可选：automaticDownloads/popups/notifications等；setting：allow/block/ask
-  - ⚠CDP的Browser.setDownloadBehavior在扩展中不可用（chrome.debugger仅tab级），此为替代方案
+  - ⚠CDP的Browser.setDownloadBehavior在扩展中不可用（chrome.debugger仅tab级），此为替代方案；playwright 后端反而可直接用 CDP `Browser.setDownloadBehavior`
 - ⭐batch混合：`{cmd:'batch', commands:[{cmd:'cookies'},{cmd:'tabs'},{cmd:'cdp',...},...]}`
   - 返回`{ok:true, results:[...]}`，一次请求多命令，CDP懒attach复用session
   - 子命令会自动继承外层batch的tabId（如cookies命令可正确获取当前页面URL）
@@ -79,10 +83,7 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
   - 省略mouseMoved会导致MUI Tooltip/Ant Design Dropdown等hover依赖组件失效
   - ⚠autofill释放是特例，只需mousePressed即可（见下方autofill章节）
 - ⭐**坐标系结论**：稳定状态下 CDP坐标 = `getBoundingClientRect()` 坐标，**无需修正**
-  - ⚠**首次attach陷阱**：CDP debugger首次attach时Chrome弹出infobar("正在受自动化控制"，~20px高)，页面内容被推下
-  - 如果在attach前测量坐标、attach后发送点击 → 坐标偏移！（之前Currency下拉失败的根因）
-  - ✅**解决**：确保测量坐标在CDP已attach稳定之后（即infobar已出现后再getBoundingClientRect）
-  - 实践：首次CDP操作前先发一个无害的`mouseMoved(0,0)`预热，之后坐标系就稳定了
+  - **[仅 TMWebDriver]** ⚠**首次attach陷阱**：扩展 chrome.debugger 首次attach时Chrome弹出infobar("正在受自动化控制"，~20px高)，页面内容被推下；attach前测坐标→attach后点击会偏移。解决：测坐标在attach稳定后，或先发无害`mouseMoved(0,0)`预热。**playwright headless 无 infobar，无此问题**
 - ⭐**下拉框(Vue3 oxd-select等)CDP操作流程**：
   1. 获取select元素rect → CDP点击打开下拉
   2. 获取option元素rect → CDP点击选中（option是动态DOM，打开后才能测量）
@@ -123,12 +124,20 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 - ⭐首选CDP截图：`Page.captureScreenshot`(format:'png')→返回base64，无需前台/后台tab也行，全页高清
 - 验证码canvas/img：JS `canvas.toDataURL()` 直接拿base64最干净
 
-## simphtml与TMWebDriver调试
-- simphtml调试必须通过`code_run`注入JS到真实浏览器（Python端无法模拟DOM）
-- `d=TMWebDriver()`, `d.set_session('url_pattern')`, `d.execute_js(code)` → 返回`{'data': value}`
+## simphtml与driver调试
+- simphtml调试必须通过`code_run`注入JS到浏览器（Python端无法模拟DOM）
+- 复用当前 driver：`import ga; ga.first_init_driver(); ga.driver.execute_js(code)` → 返回`{'data': value}`（两后端通用，勿在 playwright 后端手动 `TMWebDriver()`）
 - simphtml：`str(simphtml.optimize_html_for_tokens(html))` — 返回BS4 Tag需str()
 
-## 连不上排查
+## 连不上排查（先确认后端：`import ga; ga.first_init_driver(); print(type(ga.driver).__name__)`）
+
+### PlaywrightDriver（容器/headless 默认）
+浏览器是容器内自带的，**不存在"浏览器没开/扩展没装/WS master"问题**，按序查：
+①driver 起不来？→ 看容器日志是否有 `PlaywrightDriver 启动超时` / chromium 启动报错；确认镜像装了 `playwright==1.52.0` 且 `/ms-playwright` 有浏览器二进制
+②没有标签页（web_scan 返回空）→ 先 `web_execute_js location.href='url'` 导航出一个页面再 scan
+③未登录/拿不到数据 → `storageState` 过期，需重新登录刷新 `GA_BROWSER_STORAGE_STATE` 指向的文件（与桌面扩展无关）
+
+### [仅 TMWebDriver]（桌面/扩展后端）
 web_scan失败时按序排查（自动检测优先，用户参与放最后）：
 ①浏览器没开？→检查浏览器进程是否在跑(tasklist/ps)，没有则启动并打开正常URL（⚠about:blank等内部页不加载扩展）
 ②WS后台挂了？→本机18766端口没监听即dead→手动**后台持续运行**`from TMWebDriver import TMWebDriver; TMWebDriver()`起master
