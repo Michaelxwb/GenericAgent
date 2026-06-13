@@ -254,6 +254,9 @@ def redirect_log(script_file, log_name, label, allowed):
     print(f"[{label}] allow list: {allowed_label(allowed)}")
 
 
+SCHED_TASK_TIMEOUT = 1800   # 单个定时任务最长阻塞调度线程 30min，超时则放行下一轮（防卡死）
+
+
 def scheduled_target(prompt):
     """从定时任务 prompt 提取 [推送目标]（创建者 uid）；无则回退 GA_PUSH_TARGET env。"""
     m = re.search(r'\[推送目标\]\s*(\S+)', prompt or '')
@@ -418,7 +421,8 @@ class AgentChatMixin:
             def run():
                 fut = asyncio.run_coroutine_threadsafe(
                     self.run_agent(target, prompt, quiet=True), loop)
-                fut.result()   # 阻塞至任务完成，保证串行、不重复触发
+                # 加超时：卡死任务到点抛 TimeoutError → 调度循环捕获后继续，不被一个任务永久阻塞
+                fut.result(timeout=SCHED_TASK_TIMEOUT)
             return run
 
         threading.Thread(target=run_scheduler_loop, args=(make_runner,),

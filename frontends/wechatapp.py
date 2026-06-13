@@ -345,8 +345,13 @@ def _start_wechat_scheduler(bot):
             return None
 
         def run():
+            from chatapp_common import SCHED_TASK_TIMEOUT
             dq = agent.put_task(prompt, source='wechat', target=target)
+            deadline = time.time() + SCHED_TASK_TIMEOUT   # 超时放行，防卡死任务永久阻塞调度线程
             while True:
+                if time.time() > deadline:
+                    print('[scheduler] WeChat 定时任务超时，放弃等待', file=sys.__stdout__, flush=True)
+                    return
                 try:
                     item = dq.get(True, 3)
                 except queue.Empty:
@@ -513,6 +518,8 @@ def on_message(bot, msg):
         def _on_turn(c):
             try:
                 if c.get('exit_reason'): return
+                # ga.py 每轮调所有 hook；只在「当前运行的任务属于本会话」时推进度，防多用户串台
+                if getattr(agent, 'current_target', None) not in (None, uid): return
                 summary = c.get('summary')
                 if not summary: return
                 parts = [f"⏳ Turn {c.get('turn', '?')}: {summary}"]

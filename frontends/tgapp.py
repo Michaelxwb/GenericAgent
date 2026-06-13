@@ -23,6 +23,7 @@ from chatapp_common import (
     redirect_log,
     require_runtime,
     run_scheduler_loop,
+    SCHED_TASK_TIMEOUT,
     scheduled_target,
     split_text,
 )
@@ -893,7 +894,7 @@ def _start_tg_scheduler(application, loop):
         def run():
             fut = asyncio.run_coroutine_threadsafe(
                 _run_scheduled_tg(application, target, prompt), loop)
-            fut.result()
+            fut.result(timeout=SCHED_TASK_TIMEOUT)   # 超时放行，防卡死任务永久阻塞调度
         return run
     threading.Thread(target=run_scheduler_loop, args=(make_runner,),
                      daemon=True, name="ga-scheduler").start()

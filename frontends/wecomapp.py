@@ -184,6 +184,10 @@ class WeComApp(AgentChatMixin):
         def _on_turn(ctx):
             """Turn-end callback injected into agent. ctx = locals() from ga.py."""
             try:
+                # ga.py 每轮调所有已注册 hook；只处理「当前运行任务属于本会话」的回调，
+                # 否则多会话并发时 B 的 hook 会被 A 的 exit 触发、用 A 的结果误判 B 完成。
+                if getattr(self.agent, "current_target", None) not in (None, chat_id):
+                    return
                 if ctx.get("exit_reason"):
                     resp = ctx.get("response")
                     result["raw"] = resp.content if hasattr(resp, "content") else str(resp)
