@@ -435,6 +435,36 @@ def on_message(bot, msg):
         bot.send_text(uid, msg, context_token=ctx)
         print(f'[WX] /new reset conversation for {uid}', file=sys.__stdout__, flush=True)
         return
+    if text == '/help':
+        from chatapp_common import HELP_TEXT
+        bot.send_text(uid, HELP_TEXT, context_token=ctx)
+        return
+    if text == '/status':
+        llm = agent.get_llm_name() if agent.llmclient else '未配置'
+        bot.send_text(uid, f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}", context_token=ctx)
+        return
+    if text == '/restore':
+        from chatapp_common import format_restore
+        try:
+            restored_info, err = format_restore()
+            if err:
+                bot.send_text(uid, err, context_token=ctx)
+            else:
+                restored, fname, count = restored_info
+                agent.abort()
+                agent.history.extend(restored)
+                bot.send_text(uid, f"✅ 已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)", context_token=ctx)
+        except Exception as e:
+            bot.send_text(uid, f"❌ 恢复失败: {e}", context_token=ctx)
+        return
+    if text.startswith('/continue'):
+        from continue_cmd import handle_frontend_command as _cont
+        bot.send_text(uid, _cont(agent, text), context_token=ctx)
+        return
+    if text.startswith('/btw'):
+        from btw_cmd import handle_frontend_command as _btw
+        bot.send_text(uid, _btw(agent, text), context_token=ctx)
+        return
     if text.startswith('/llm'):
         args = text.split()
         if len(args) > 1:
