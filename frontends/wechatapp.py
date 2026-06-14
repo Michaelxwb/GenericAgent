@@ -14,6 +14,10 @@ class AuthExpired(Exception):
 
 # ── Per-user abort flags (shared between on_message invocations) ──
 _task_aborted: dict = {}  # uid -> True  (set by /stop, read by _handle)
+# ── Per-user 最近一次 context_token ──
+# 个微(ilink)只能在"会话内"(带 context_token)发消息；context_token 为空的主动推送返回 ret -2。
+# 收消息时记下该用户最新 token，定时/主动推送时复用，让推送落在用户近期会话窗口内。
+_last_ctx: dict = {}  # uid -> context_token
 
 # ── WxBotClient (inline from wx_bot_client.py) ──
 for _k in ('HTTPS_PROXY', 'https_proxy'):
@@ -364,18 +368,18 @@ def _start_wechat_scheduler(bot):
                     result = item.get('done', '')
                     final = (outputs[-1] if outputs else '') or result
                     text = re.sub(r'\[FILE:[^\]]+\]', '', _clean(final)).strip()  # 剥 [FILE:] 标记
-                    try:
-                        if text:
-                            bot.send_text(target, text[:3000])
-                    except Exception as e:
-                        print(f'[scheduler] WeChat 主动推送失败: {e}', file=sys.__stdout__)
-                    # 补发文件：scheduler 报告路径 + 结果里的 [FILE:...]，都作为附件发出
+                    # 附件：scheduler 报告路径 + 结果里的 [FILE:...]
                     paths = list(re.findall(r'\[FILE:([^\]]+)\]', result))
                     rpt = re.search(r'(\S*sche_tasks/done/\S+\.md)', prompt)
                     if rpt:
                         paths.append(rpt.group(1))
-                    for p in dict.fromkeys(paths):   # 去重保序
-                        _wx_send_file(bot, target, p.strip())
+                    paths = [p.strip() for p in dict.fromkeys(paths)]   # 去重保序
+                    pctx = _last_ctx.get(target, '')   # 用户最近会话 token；有效则当前会话内可直达
+                    if text and _wx_try_send_text(bot, target, text, pctx):
+                        for p in paths:                 # 会话激活 → 文件也能直达
+                            _wx_send_file(bot, target, p, pctx)
+                    else:                               # 用户空闲 → 主动推送被丢弃，转存待下次会话补发
+                        _pending_add(target, text, paths)
                     return
         return run
     start_supervised_scheduler(make_runner)   # 防死 + 看门狗自重启
@@ -413,6 +417,72 @@ def _wx_send_file(bot, to_uid, fpath, ctx=''):
             print(f'[WX] send_file 回退也失败: {e2}', file=sys.__stdout__, flush=True)
             return False
 
+def _wx_try_send_text(bot, to_uid, text, ctx=''):
+    """尝试发文本，仅当 ret==0 才算真送达。个微空闲用户主动文本会 ret -2（不投递）。"""
+    try:
+        r = bot.send_text(to_uid, text[:3000], context_token=ctx)
+        return not (isinstance(r, dict) and r.get('ret') not in (0, None))
+    except Exception as e:
+        print(f'[WX] send_text 异常: {e}', file=sys.__stdout__, flush=True)
+        return False
+
+# ── 延迟投递队列 ──
+# 个微只能在活跃会话窗口内发消息；定时任务到点用户空闲时主动推送不投递。
+# 把结果暂存到持久文件，用户下次给机器人发消息(会话激活)时由 on_message 补发。
+_PENDING_PATH = os.path.join(os.path.dirname(_TEMP_DIR), 'sche_tasks', 'pending_push.jsonl')
+_pending_lock = threading.Lock()
+
+def _pending_add(target, text, files):
+    rec = {'target': target, 'text': text or '', 'files': list(files or []), 'ts': time.time()}
+    try:
+        with _pending_lock:
+            os.makedirs(os.path.dirname(_PENDING_PATH), exist_ok=True)
+            with open(_PENDING_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        print(f'[WX] 用户空闲，定时结果转存待投递 → {target}', file=sys.__stdout__, flush=True)
+    except Exception as e:
+        print(f'[WX] pending 转存失败: {e}', file=sys.__stdout__, flush=True)
+
+def _pending_flush(bot, uid, ctx):
+    """用户发消息触发：补发暂存给该用户的定时结果（此刻会话激活，send_text 可达）。"""
+    if not uid:
+        return
+    with _pending_lock:
+        try:
+            if not os.path.exists(_PENDING_PATH):
+                return
+            with open(_PENDING_PATH, encoding='utf-8') as f:
+                lines = [l for l in f if l.strip()]
+        except Exception:
+            return
+        mine, others = [], []
+        for l in lines:
+            try:
+                r = json.loads(l)
+            except Exception:
+                continue
+            (mine if r.get('target') == uid else others).append(r)
+        if not mine:
+            return
+        # 先重写剩余，避免补发中途崩溃导致重复投递
+        try:
+            with open(_PENDING_PATH, 'w', encoding='utf-8') as f:
+                for r in others:
+                    f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f'[WX] pending 重写失败: {e}', file=sys.__stdout__, flush=True)
+            return
+    for r in mine:
+        try:
+            body = r.get('text', '')
+            if body:
+                _wx_try_send_text(bot, uid, '📬 这是之前的定时任务结果：\n\n' + body, ctx)
+            for p in r.get('files', []):
+                _wx_send_file(bot, uid, p, ctx)
+            print(f'[WX] 已补发暂存定时结果 → {uid}', file=sys.__stdout__, flush=True)
+        except Exception as e:
+            print(f'[WX] 补发失败: {e}', file=sys.__stdout__, flush=True)
+
 if not hasattr(agent, '_turn_end_hooks'):
     agent._turn_end_hooks = {}
 
@@ -420,6 +490,10 @@ def on_message(bot, msg):
     text = bot.extract_text(msg).strip()
     uid = msg.get('from_user_id', '')
     ctx = msg.get('context_token', '')
+    if ctx and uid:
+        _last_ctx[uid] = ctx   # 记下最新会话 token，供主动推送复用
+        # 会话激活：后台补发该用户被暂存的定时结果，不阻塞当前消息处理
+        threading.Thread(target=_pending_flush, args=(bot, uid, ctx), daemon=True).start()
     media_paths = _dl_media(msg.get('item_list', []))
     if not text and not media_paths: return
     if media_paths:
