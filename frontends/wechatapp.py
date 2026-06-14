@@ -569,48 +569,78 @@ def on_message(bot, msg):
                 _typing_stop.wait(2.0)
         threading.Thread(target=_keep_typing, daemon=True).start()
         item = {}
-        def _wx_send(text):
-            s = text.strip(); t0 = time.time()
-            try:
-                bot.send_text(uid, s, context_token=ctx)
-                print(f'[WX] send ok len={len(s)} dt={time.time()-t0:.1f}s', file=sys.__stdout__)
-                return True
-            except Exception as e:
-                print(f'[WX] send err len={len(s)} dt={time.time()-t0:.1f}s {type(e).__name__}: {e}', file=sys.__stdout__)
-                return False
+        def _wx_send(text, retries=0):
+            # ret!=0 视为被拒（ilink 会话内限流会回 ret -2）。仅 retries>0 时退避重试，
+            # 留给最终答案保证送达；进度不重试以免加剧刷屏。
+            s = text.strip()
+            for attempt in range(retries + 1):
+                t0 = time.time()
+                try:
+                    r = bot.send_text(uid, s, context_token=ctx)
+                    if isinstance(r, dict) and r.get('ret') not in (0, None):
+                        print(f'[WX] send 被拒 ret={r.get("ret")} len={len(s)} try={attempt}', file=sys.__stdout__)
+                        if attempt < retries: time.sleep(12 * (attempt + 1)); continue
+                        return False
+                    print(f'[WX] send ok len={len(s)} dt={time.time()-t0:.1f}s', file=sys.__stdout__)
+                    return True
+                except Exception as e:
+                    print(f'[WX] send err len={len(s)} dt={time.time()-t0:.1f}s {type(e).__name__}: {e}', file=sys.__stdout__)
+                    if attempt < retries: time.sleep(12 * (attempt + 1)); continue
+                    return False
+            return False
         # 非阻塞发送：hook 只入队（瞬时），单独发送线程按序发，绝不阻塞 agent 轮次线程。
+        # 队列元素 (text, retries)：进度 retries=0；最终答案 retries=3（被限流退避重发，保证送达）。
         _send_q = queue.Queue()
         def _sender_loop():
             while True:
                 m = _send_q.get()
                 if m is None: break
-                _wx_send(m)
+                _wx_send(m[0], m[1])
         _sender = threading.Thread(target=_sender_loop, daemon=True); _sender.start()
         # 进度流（对齐企微）：turn-end hook 每轮推 "⏳ Turn N: 摘要 + 🛠 工具"，长任务可见在干活。
         hook_key = f'wechat_{uid}'
+        _last_prog = [0.0]
         def _on_turn(c):
             try:
                 if c.get('exit_reason'): return
                 # ga.py 每轮调所有 hook；只在「当前运行的任务属于本会话」时推进度，防多用户串台
                 if getattr(agent, 'current_target', None) not in (None, uid): return
+                # 限流：进度最多每 12s 一条。长任务每轮都发会触发 ilink 会话内发送限流
+                # （~10 条/窗口），把配额耗光导致最终答案被丢。
+                now = time.time()
+                if now - _last_prog[0] < 12: return
                 summary = c.get('summary')
                 if not summary: return
+                _last_prog[0] = now
                 parts = [f"⏳ Turn {c.get('turn', '?')}: {summary}"]
                 tools = c.get('tool_calls') or []
                 if tools:
                     parts.append('🛠 ' + ', '.join(_fmt_tool(tc) for tc in tools[:3]))
-                _send_q.put('\n'.join(parts))   # 非阻塞入队，不等 HTTP
+                _send_q.put(('\n'.join(parts), 0))   # 非阻塞入队，不等 HTTP
             except Exception as e:
                 print(f'[WX hook] {e}', file=sys.__stdout__)
         agent._turn_end_hooks[hook_key] = _on_turn
+        # 硬超时：交互任务最多 10min。难任务（如大图 OCR）会卡死 agent 既不出答案也不释放，
+        # 后续消息全堵。超时则 abort（置 stop_sig + code_stop_signal 中断轮次/代码），保证用户拿到回应。
+        INTERACT_MAX = 600
+        deadline = time.time() + INTERACT_MAX
+        timed_out = False
         try:
-            while 'done' not in (item := dq.get(timeout=300)):
-                pass
-        except queue.Empty:
-            item = {}
+            while True:
+                try:
+                    it = dq.get(timeout=15)
+                except queue.Empty:
+                    if time.time() > deadline: timed_out = True; break
+                    continue
+                if 'done' in it:
+                    item = it; break
+                if time.time() > deadline: timed_out = True; break
         finally:
             agent._turn_end_hooks.pop(hook_key, None)
             _typing_stop.set()
+        if timed_out:
+            try: agent.abort()
+            except Exception: pass
 
         # 最终答案：取最后一轮输出（等价企微 resp.content），_clean 去噪
         result = item.get('done', '')
@@ -620,10 +650,12 @@ def on_message(bot, msg):
         final = re.sub(r'\[FILE:[^\]]+\]', '', final).strip()   # 剥掉 [FILE:] 标记，文件单独作附件发
         if aborted:
             final = (final + '\n\n⏹️ [已停止]').strip()
+        if timed_out:
+            final = (final + '\n\n⏱️ [任务超时已中止，可能过于复杂或卡在某步——可换个更具体的说法重试]').strip()
         if final:
-            _send_q.put(final[-3000:])     # 走同一队列，排在进度之后
+            _send_q.put((final[-3000:], 3))   # 最终答案：被限流退避重试 3 次，保证送达
         _send_q.put(None)
-        _sender.join(timeout=120)          # 等文本按序发完，再发文件
+        _sender.join(timeout=180)          # 等文本按序发完（含重试），再发文件
 
         bad = {'filepath', '<filepath>', 'path', '<path>', 'file_path', '<file_path>', '...'}
         files = [f for f in re.findall(r'\[FILE:([^\]]+)\]', result)
