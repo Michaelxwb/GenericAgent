@@ -336,7 +336,7 @@ def _clean(t):
 # 到点 → put_task → 取 done → bot.send_text(target) 主动推送（context_token 留空即主动发）。
 # GA_PUSH_TARGET 填用户的 wechat uid。
 def _start_wechat_scheduler(bot):
-    from chatapp_common import run_scheduler_loop, scheduled_target
+    from chatapp_common import start_supervised_scheduler, scheduled_target
 
     def make_runner(prompt):
         target = scheduled_target(prompt)   # 任务自带 [推送目标] 优先，回退 GA_PUSH_TARGET
@@ -378,8 +378,7 @@ def _start_wechat_scheduler(bot):
                         _wx_send_file(bot, target, p.strip())
                     return
         return run
-    threading.Thread(target=run_scheduler_loop, args=(make_runner,),
-                     daemon=True, name='ga-scheduler').start()
+    start_supervised_scheduler(make_runner)   # 防死 + 看门狗自重启
 
 def _fmt_tool(tc):
     name = tc.get('tool_name', '?')

@@ -277,14 +277,43 @@ def _load_scheduler():
     return m
 
 
-def run_scheduler_loop(make_runner, label="scheduler"):
-    """通道无关的定时任务轮询线程主体（在后台线程跑，支持 async/sync 两类前端）。
+def _safe_print(msg):
+    """打印失败（如 stdout 管道断裂 BrokenPipe）不得让调度线程崩溃。"""
+    try:
+        print(msg)
+    except Exception:
+        pass
 
-    每 60s 调 scheduler.check()，到点 → make_runner(prompt) 返回一个无参 runner（同步执行
-    该任务，含投递），None 表示跳过（如未配置推送目标）。runner() 在本线程**同步阻塞至完成**
-    再进入下一轮 —— 天然串行、不会在报告写盘前重复触发，无需额外去重。
-    async 前端的 runner 用 run_coroutine_threadsafe(...).result() 把协程跑完再返回。
+
+def run_scheduler_loop(make_runner, check_fn, label="scheduler"):
+    """通道无关的定时任务轮询线程主体（async/sync 前端通用）。
+
+    每 60s 调 check_fn()，到点 → make_runner(prompt) 返回无参 runner（同步执行+投递），
+    None 表示跳过。runner() 同步阻塞至完成再进下一轮，天然串行不重复触发。
+    **设计为打不死**：所有异常（含 print/sleep 失败）一律吞掉，绝不让后台调度线程静默退出
+    （历史 bug：tick 里 print BrokenPipe 等会逃逸 except 杀死线程，导致定时任务全停且无人察觉）。
     """
+    _safe_print(f"[{label}] 定时任务轮询已启动（每 60s）")
+    while True:
+        try:
+            prompt = check_fn()
+            if prompt:
+                runner = make_runner(prompt)
+                if runner is not None:
+                    runner()
+            time.sleep(60)
+        except Exception as e:
+            _safe_print(f"[{label}] tick error: {e}")
+            try:
+                time.sleep(5)
+            except Exception:
+                pass
+
+
+def start_supervised_scheduler(make_runner, label="scheduler"):
+    """启动调度循环 + 看门狗：调度线程一旦死亡（极端情况），看门狗 30s 内自动重启它。
+    scheduler 只加载一次（check_fn 复用），避免重启时重新 import 触发端口锁冲突。
+    供 mixin 与 tg/wechat 等所有前端统一调用。"""
     try:
         sched = _load_scheduler()
     except Exception as e:
@@ -292,17 +321,29 @@ def run_scheduler_loop(make_runner, label="scheduler"):
         return
     if sched is None:
         return
-    print(f"[{label}] 定时任务轮询已启动（每 60s）")
-    while True:
-        try:
-            prompt = sched.check()
-            if prompt:
-                runner = make_runner(prompt)
-                if runner is not None:
-                    runner()
-        except Exception as e:
-            print(f"[{label}] tick error: {e}")
-        time.sleep(60)
+    check_fn = sched.check
+    state = {"thread": None}
+
+    def _spawn():
+        t = threading.Thread(target=run_scheduler_loop, args=(make_runner, check_fn, label),
+                             daemon=True, name="ga-scheduler")
+        t.start()
+        state["thread"] = t
+
+    _spawn()
+
+    def _watchdog():
+        while True:
+            try:
+                time.sleep(30)
+                t = state["thread"]
+                if t is None or not t.is_alive():
+                    _safe_print(f"[{label}] 调度线程已死，看门狗重启")
+                    _spawn()
+            except Exception:
+                pass
+
+    threading.Thread(target=_watchdog, daemon=True, name="ga-sched-watchdog").start()
 
 
 class AgentChatMixin:
@@ -425,8 +466,7 @@ class AgentChatMixin:
                 fut.result(timeout=SCHED_TASK_TIMEOUT)
             return run
 
-        threading.Thread(target=run_scheduler_loop, args=(make_runner,),
-                         daemon=True, name="ga-scheduler").start()
+        start_supervised_scheduler(make_runner)   # 防死 + 看门狗自重启
 
 
 from agentmain import GeneraticAgent as _GA
