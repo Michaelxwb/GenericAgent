@@ -610,7 +610,7 @@ class GenericAgentHandler(BaseHandler):
         elif turn % 7 == 0:
             next_prompt += f"\n\n[SYSTEM] Turn {turn}. Call update_working_checkpoint to save key context. Stop ineffective retries; if no progress, switch strategy: 1) Probe physical boundaries 2) **Re-read relevant SOPs**"
         elif turn % 25 == 0:
-            next_prompt += f"\n\n[SYSTEM] Turn {turn}. Write checkpoints/key findings/tried approaches to a file for future reference. Avoid losing critical info."
+            next_prompt += f"\n\n[SYSTEM] Turn {turn}. Write checkpoints/key findings/tried approaches to a **file** for future reference (not only working_checkpoint!). Avoid losing critical info."
         elif turn % 10 == 0: next_prompt += get_global_memory()
 
         if _plan and turn >= 10 and turn % 5 == 0:
