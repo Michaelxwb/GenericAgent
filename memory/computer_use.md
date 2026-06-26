@@ -12,7 +12,8 @@
 | 3 vision(VLM) | 2仍不足时才用 | 仅语义理解、确认界面状态、辅助判断目标 | 不可信其坐标 |
 
 Windows 下窗口截图和操作使用 ljqCtrl：严禁 pyautogui；记得先 Activate 到前台；
-坑1-DPI：一律物理坐标；坑2-遮盖/失焦：混乱先枚举窗口确认前台；
+ui_detect附送OCR，不要单独使用OCR
+坑1-DPI：必须先import ljqCtrl，之后一律使用物理坐标；坑2-遮盖/失焦：混乱先枚举窗口确认前台；
 ui_detect 的 bbox 是截图内坐标，点击前必须用 `ClientToScreen(hwnd,(0,0))/dpi_scale + bbox中心` 转屏幕物理坐标
 坐标转换禁用 `GetWindowRect` 或 DWM 窗口矩形直接加截图坐标（含标题栏/边框/阴影会错位）
 ljqCtrl.Click 后会返回像素/前台变化，0% 或近 0% 变化立即停下诊断，禁止盲目重试。

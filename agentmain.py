@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale
+import os, sys, threading, queue, time, json, re, random, locale, glob
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -182,8 +182,6 @@ class GenericAgent:
                 if self.inc_out and last_pos < len(full_resp):
                     display_queue.put({'next': full_resp[last_pos:], 'source': source,
                                     'turn': curr_turn, 'outputs': turn_resps[-2:]})
-                #if '</summary>' in full_resp: full_resp = full_resp.replace('</summary>', '</summary>\n\n')
-                #if '</file_content>' in full_resp: full_resp = re.sub(r'<file_content>\s*(.*?)\s*</file_content>', r'\n````\n<file_content>\n\1\n</file_content>\n````', full_resp, flags=re.DOTALL)                
                 display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
                 self.history = handler.history_info
             except Exception as e:
@@ -202,6 +200,7 @@ if __name__ == '__main__':
     from datetime import datetime
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', metavar='IODIR', help='一次性任务模式，先看subagent.md')
+    parser.add_argument('--func', metavar='PROMPT_FILE', help='纯函数模式：读prompt文件→结果写prompt.out.txt→退出')
     parser.add_argument('--reflect', metavar='SCRIPT', help='反射模式：加载监控脚本，check()触发时发任务')
     parser.add_argument('--input', help='prompt')
     parser.add_argument('--llm_no', type=int, default=0)
@@ -210,14 +209,17 @@ if __name__ == '__main__':
     args, _unknown = parser.parse_known_args()
     _reflect_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
 
-    if args.task and not args.nobg:
+    if (args.func or args.task) and not args.nobg:
         import subprocess, platform
         cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:]] + ['--nobg']
-        d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+        if args.task:
+            d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+            out = open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8')
+            err = open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8')
+        else: out, err = subprocess.DEVNULL, subprocess.DEVNULL
         p = subprocess.Popen(cmd, cwd=script_dir,
             creationflags=0x08000000 if platform.system() == 'Windows' else 0,
-            stdout=open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8'),
-            stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'))
+            stdout=out, stderr=err)
         print('PID:', p.pid); sys.exit(0)
 
     agent = GeneraticAgent()
@@ -226,31 +228,35 @@ if __name__ == '__main__':
     threading.Thread(target=agent.run, daemon=True).start()
 
     if args.task:
-        agent.peer_hint = False
-        agent.force_non_stream = True
         agent.task_dir = d = os.path.join(script_dir, f'temp/{args.task}'); nround = ''
-        infile = os.path.join(d, 'input.txt')
+        infile = os.path.join(d, 'input.txt'); outfile = f'{d}/output{nround}.txt'
         if args.input:
             os.makedirs(d, exist_ok=True)
-            import glob; [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
+            [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
             with open(infile, 'w', encoding='utf-8') as f: f.write(args.input)
         if (fh := consume_file(d, '_history.json')): agent.llmclient.backend.history = json.loads(fh)
+    elif args.func:
+        infile = args.func; outfile = os.path.splitext(args.func)[0] + '.out.txt'
+
+    if args.func or args.task:
+        agent.peer_hint = False
         with open(infile, encoding='utf-8') as f: raw = f.read()
         while True:
-            dq = agent.put_task(raw, source='task')
+            dq = agent.put_task(raw, source='func' if args.func else 'task')
             while 'done' not in (item := dq.get(timeout=1200)): 
-                if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
-                    with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
-            with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
+                if 'next' in item: 
+                    with open(outfile, 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
+            with open(outfile, 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
+            if not args.task: break
             consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
             for _ in range(300):  # 等reply.txt，10分钟超时
                 time.sleep(2)
                 if (raw := consume_file(d, 'reply.txt')): break
             else: break
             nround = nround + 1 if isinstance(nround, int) else 1
+            outfile = f'{d}/output{nround}.txt'
     elif args.reflect:
         agent.peer_hint = False
-        agent.force_non_stream = True
         import importlib.util
         spec = importlib.util.spec_from_file_location('reflect_script', args.reflect)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
