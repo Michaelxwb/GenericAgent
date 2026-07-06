@@ -55,6 +55,7 @@ memory/L4_raw_sessions/*
 !memory/ljqCtrl_sop.md
 !memory/macljqCtrl.py
 !memory/computer_use.md
+!memory/ljqCtrlBg.py
 
 # procmem_scanner related tools
 !memory/procmem_scanner.py
@@ -77,6 +78,9 @@ memory/L4_raw_sessions/*
 
 # Plan SOP
 !memory/plan_sop.md
+
+# UltraPlan SOP
+!memory/ultraplan_sop.md
 
 # Goal Mode SOP
 !memory/goal_mode_sop.md
@@ -134,10 +138,7 @@ reflect/*
 
 # Conductor IM plugins: 私有插件/配置不入库。示例为 _email_example.py / _lark_example.py
 # （以 _ 开头不会被加载器自动轮询）。去掉下划线/示例后缀复制为 email.py / lark.py 即启用。
-frontends/conductor_im_plugins/wechat.py
-frontends/conductor_im_plugins/email.py
-frontends/conductor_im_plugins/lark.py
-frontends/conductor_im_plugins/config.local.json
+frontends/conductor_im_plugins/*
 
 # Universal: never track __pycache__ anywhere
 **/__pycache__/

@@ -71,6 +71,29 @@ def init():
 
 agent = init()
 
+def build_prompt(objective):
+    return f"""读取 {agent.log_path} 尾部，获取 agent 的最新输出。
+用户的 loop 诉求：<objective>{objective}</objective>
+判断该 agent 是否偷懒、是否真正完成诉求，用 <next_prompt></next_prompt> 输出要追加给它的指令：
+一般复述 objective，或不超过 10 字的**督促**，如：别停，继续 / 这就叫最优？你优化到位了吗 / 看我要求，你达成了吗 / 你好好看清楚 / 你能不能看看记忆 / 把关键发现和阶段性成果落盘，然后继续
+不允许促进 agent 停止或代替宣告任务完成，只允许催促不要对原任务进行评价，特别**禁止**“任务已完成，结束”这种让agent结束的指令，你的任务是让agent继续loop而非停止。
+只输出 <next_prompt>…</next_prompt>，若需要停止则不要输出此tag。
+"""
+
+@st.cache_resource
+def get_controller():
+    b = {'ev': threading.Event(), 'obj': '', 'out': None, 'ready': False}
+    def loop():
+        ag = GeneraticAgent(); ag.verbose = False; ag.log_path = False
+        threading.Thread(target=ag.run, daemon=True).start()
+        while True:
+            b['ev'].wait(); b['ev'].clear()
+            dq = ag.put_task(build_prompt(b['obj']), source="controller")
+            while 'done' not in (it := dq.get()): pass
+            ms = re.findall(r'<next_prompt>(.*?)</next_prompt>', it['done'], re.S)
+            b['out'] = ms[-1].strip() if ms else None; b['ready'] = True
+    threading.Thread(target=loop, daemon=True).start(); return b
+
 st.title("🖥️ Cowork")
 
 st.session_state.setdefault('autonomous_enabled', False)
@@ -119,9 +142,7 @@ def render_sidebar():
         field-sizing: content; min-height: 1.6em !important; height: auto !important;
     }
     </style>""", unsafe_allow_html=True)
-    def _sync_loop_prompt():
-        st.session_state.loop_prompt = st.session_state.loop_prompt_input
-    loop_prompt = st.text_area("Loop prompt", value=st.session_state.get('loop_prompt', "继续" if LANG=='zh' else 'next'), key="loop_prompt_input", height=1, on_change=_sync_loop_prompt)
+    st.text_area("Loop prompt", value=st.session_state.get('loop_prompt_input', "继续" if LANG=='zh' else 'next'), key="loop_prompt_input", height=1)
     if st.session_state.get('loop_enabled'):
         if st.button("⏹️ Stop Loop"):
             st.session_state.loop_enabled = False
@@ -130,8 +151,8 @@ def render_sidebar():
     else:
         if st.button("🔁 Loop!"):
             st.session_state.loop_enabled = True
-            st.session_state.loop_prompt = loop_prompt
-            st.session_state['_inject_prompt'] = loop_prompt
+            get_controller()
+            st.session_state['_inject_prompt'] = st.session_state.get('loop_prompt_input', '')
             st.toast("🔁 Looping"); st.rerun(scope="app")
     st.divider()
     if st.button(T('auto_start')):
@@ -252,10 +273,10 @@ def render_main_stream(prompt=None):
     if response:
         st.session_state.messages.append({"role": "assistant", "content": response})
         st.session_state.last_reply_time = int(time.time())
-        # ── 循环回调：回答完成后自动注入下一条 ──
+        # ── 循环回调：回答完成戳醒 controller 决策(去程,现取最新objective) ──
         if st.session_state.get('loop_enabled'):
-            st.session_state['_inject_prompt'] = st.session_state.get('loop_prompt', '继续')
-            st.rerun()
+            b = get_controller()
+            b['obj'] = st.session_state.get('loop_prompt_input', ''); b['ready'] = False; b['ev'].set()
 
 if "messages" not in st.session_state: st.session_state.messages = []
 for msg in st.session_state.messages:
@@ -365,11 +386,18 @@ elif st.session_state.get('display_queue') is not None:
     render_main_stream()
 
 # ── 空闲自主行动：fragment 定时检测，替代 launch.pyw 的 idle_monitor ──
-@st.fragment(run_every=timedelta(minutes=5))
+@st.fragment(run_every=timedelta(minutes=1))
 def _idle_checker():
+    if st.session_state.get('loop_enabled'):
+        b = get_controller()
+        if b['ready']:
+            b['ready'] = False
+            if b['out'] and '停止循环' not in b['out']: st.session_state['_inject_prompt'] = b['out']
+            else: st.session_state.loop_enabled = False
+            st.rerun(scope="app")
+        return
     if not st.session_state.get('autonomous_enabled'): return
     if st.session_state.get('display_queue') is not None: return   # 正在运行中
-    if st.session_state.get('loop_enabled'): return                # 循环模式自己管
     last = st.session_state.get('last_reply_time', int(time.time()))
     if time.time() - last > 1800:
         st.session_state['_inject_prompt'] = T('auto_prompt')

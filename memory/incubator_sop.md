@@ -15,16 +15,15 @@ memory下大部分文件不适合分发，不要复制 memory 下未被 gitignor
 - `GARoot/*.py` 必须包含根目录所有 `.py`。
 - `GARoot/assets/*.txt *.json` 必须包含 assets 顶层所有 `.txt`/`.json`。
 - `GARoot/memory/` 只取 `.gitignore` 白名单/已允许分发文件；排除 `global_mem.txt`、`global_mem_insight.txt`、`__pycache__/`、`*.pyc`。
-- 按当前清单实测压缩包约153KB/55文件；正常不应超过170KB，文件数不应超过60。
+- 按当前清单实测压缩包约153KB/55文件；正常不应超过200KB，文件数不应超过60。
 
 ## 依赖
 requests beautifulsoup4
 尽量复用远端已有python/venv
 
 ## 通信
-看subagent.md
-同subagent协议：`agentmain.py --task {name} --input "..."`
-或起reflect worker并设置bbs信息
+1. **首选** 阅读 `assets/ga_httpapp.py`（HTTP API，~50行自解释）
+2. 备选：subagent.md 文件协议 或 reflect worker + bbs
 
 ## 干预记忆
 直接编辑远端 memory/ 下的文件（SOP/全局记忆）
